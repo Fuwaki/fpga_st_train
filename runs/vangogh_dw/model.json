@@ -1,0 +1,12 @@
+{
+  "arch": "tiny_dw",
+  "options": {
+    "base": 32,
+    "res_blocks": 4
+  },
+  "meta": {
+    "iterations": 4000,
+    "run": "vangogh_dw",
+    "style": "configs/../../style-transfer/data/styles/vangogh/starry_night.jpg"
+  }
+}

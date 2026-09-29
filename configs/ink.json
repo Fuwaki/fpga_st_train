@@ -1,0 +1,54 @@
+{
+  "run": {
+    "name": "ink",
+    "output_dir": "../runs/ink",
+    "seed": 0,
+    "device": "d0",
+    "log_every": 100,
+    "checkpoint_every": 2000,
+    "sample_every": 500,
+    "sample_content": "../../style-transfer/demo_inputs",
+    "sample_size": 384
+  },
+  "data": {
+    "content_dir": "../../style-transfer/data/content",
+    "pseudo_gt_dir": null,
+    "crop": 192,
+    "batch_size": 4,
+    "limit": null
+  },
+  "teacher": {
+    "weights_dir": "../../teacher-eval/MicroAST/models",
+    "style": "../../style-transfer/data/styles/ink/fankuan.jpg",
+    "style_size": 256,
+    "alpha": 1,
+    "enabled": true
+  },
+  "loss": {
+    "pixel": 1,
+    "gradient": 2,
+    "feature": 0,
+    "tv": 0,
+    "perceptual": 0,
+    "style": 0,
+    "vgg_weights": null
+  },
+  "optim": {
+    "learning_rate": 0.0006,
+    "beta_1": 0.9,
+    "beta_2": 0.999,
+    "epsilon": 0.00001,
+    "iterations": 4000,
+    "schedule": {
+      "kind": "constant"
+    },
+    "grad_clip": null
+  },
+  "student": {
+    "arch": "tiny",
+    "options": {
+      "base": 32,
+      "res_blocks": 4
+    }
+  }
+}

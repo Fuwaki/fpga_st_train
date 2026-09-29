@@ -1,0 +1,17 @@
+{
+  "arch": "tiny",
+  "options": {
+    "base": 32,
+    "res_blocks": 4
+  },
+  "meta": {
+    "bits": "W8A8",
+    "calibration_batches": 20,
+    "calibration_safety": 1.0,
+    "iterations": 4000,
+    "run": "vangogh",
+    "style": "configs/../../style-transfer/data/styles/vangogh/starry_night.jpg",
+    "weight_bytes": 375824,
+    "weight_packing": "i8-x1"
+  }
+}

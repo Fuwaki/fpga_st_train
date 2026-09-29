@@ -1,0 +1,34 @@
+[package]
+name = "fpga_st_train"
+version = "0.1.0"
+edition = "2024"
+description = "FPGA-friendly style transfer: MicroAST teacher inference + distillation training framework"
+
+[features]
+# `wgpu` is WGSL via CubeCL. `vulkan` is the same runtime with CubeCL's SPIR-V
+# compiler (tensor-core kernels on NVIDIA). Build one of them, not both:
+#   cargo run --release --no-default-features --features vulkan
+default = ["wgpu"]
+wgpu = ["burn/wgpu"]
+vulkan = ["burn/wgpu", "burn/vulkan"]
+# Pure-CPU fallback / correctness oracle: --no-default-features --features ndarray
+ndarray = ["burn/ndarray"]
+
+[dependencies]
+# --- deep learning ---
+burn = { version = "0.21.0", features = ["train", "autodiff", "dataset", "std", "store"] }
+burn-store = "0.21.0"
+# --- errors / config ---
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# --- cli / logging ---
+clap = { version = "4", features = ["derive"] }
+log = "0.4"
+env_logger = "0.11"
+indicatif = "0.17"
+# --- io / data ---
+image = "0.25"
+rayon = "1"
+rand = "0.9"

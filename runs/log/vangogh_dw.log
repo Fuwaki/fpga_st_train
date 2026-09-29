@@ -1,0 +1,43 @@
+   Compiling fpga_st_train v0.1.0 (/run/media/fuwaki/Workspace/competition/2026fpga/fpga_st_train)
+    Finished `release` profile [optimized] target(s) in 1m 19s
+     Running `/tmp/cursor-sandbox-cache/cfd774f7b07a8c233eb9dc6f5ec2e4cf/cargo-target/release/fpga_st_train --device d1 train --config configs/vangogh_dw.json`
+[2026-09-26T12:50:53Z INFO  fpga_st_train::backend] backend vulkan (SPIR-V/CubeCL), device spec "d1" -> DiscreteGpu(1)
+[2026-09-26T12:50:53Z INFO  fpga_st_train::data::dataset] dataset: 13394 pairs
+[2026-09-26T12:50:54Z INFO  wgpu_hal::vulkan::adapter] Found 6 cooperative matrix configurations supported by wgpu
+[2026-09-26T12:50:54Z INFO  cubecl_wgpu::runtime] Using adapter AdapterInfo { name: "Tesla T10x", vendor: 4318, device: 7735, device_type: DiscreteGpu, device_pci_bus_id: "0000:04:00.0", driver: "NVIDIA", driver_info: "580.178.04", backend: Vulkan, subgroup_min_size: 32, subgroup_max_size: 32, transient_saves_memory: false }
+[2026-09-26T12:50:54Z INFO  cubecl_wgpu::runtime] Created wgpu compute server on device Device { inner: Core(CoreDevice { context: ContextWgpuCore { type: "Native" }, id: Id(0,1), error_sink: Mutex { data: ErrorSink }, features: Features { features_wgpu: FeaturesWGPU(SHADER_FLOAT32_ATOMIC | TEXTURE_FORMAT_16BIT_NORM | TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES | PIPELINE_STATISTICS_QUERY | TIMESTAMP_QUERY_INSIDE_ENCODERS | TIMESTAMP_QUERY_INSIDE_PASSES | TEXTURE_BINDING_ARRAY | BUFFER_BINDING_ARRAY | STORAGE_RESOURCE_BINDING_ARRAY | SAMPLED_TEXTURE_AND_STORAGE_BUFFER_ARRAY_NON_UNIFORM_INDEXING | STORAGE_TEXTURE_ARRAY_NON_UNIFORM_INDEXING | PARTIALLY_BOUND_BINDING_ARRAY | MULTI_DRAW_INDIRECT_COUNT | ADDRESS_MODE_CLAMP_TO_ZERO | ADDRESS_MODE_CLAMP_TO_BORDER | POLYGON_MODE_LINE | POLYGON_MODE_POINT | CONSERVATIVE_RASTERIZATION | VERTEX_WRITABLE_STORAGE | CLEAR_TEXTURE | MULTIVIEW | TEXTURE_ATOMIC | TEXTURE_FORMAT_NV12 | TEXTURE_FORMAT_P010 | EXPERIMENTAL_RAY_QUERY | SHADER_F64 | SHADER_I16 | SHADER_EARLY_DEPTH_TEST | SHADER_INT64 | SUBGROUP | SUBGROUP_VERTEX | SUBGROUP_BARRIER | PIPELINE_CACHE | SHADER_INT64_ATOMIC_MIN_MAX | SHADER_INT64_ATOMIC_ALL_OPS | TEXTURE_INT64_ATOMIC | EXPERIMENTAL_MESH_SHADER | EXPERIMENTAL_RAY_HIT_VERTEX_RETURN | EXPERIMENTAL_MESH_SHADER_MULTIVIEW | EXTENDED_ACCELERATION_STRUCTURE_VERTEX_FORMATS | PASSTHROUGH_SHADERS | SHADER_BARYCENTRICS | SELECTIVE_MULTIVIEW | EXPERIMENTAL_MESH_SHADER_POINTS | MULTISAMPLE_ARRAY | EXPERIMENTAL_COOPERATIVE_MATRIX | SHADER_PER_VERTEX | SHADER_DRAW_INDEX | ACCELERATION_STRUCTURE_BINDING_ARRAY | MEMORY_DECORATION_COHERENT | MEMORY_DECORATION_VOLATILE), features_webgpu: FeaturesWebGPU(DEPTH_CLIP_CONTROL | DEPTH32FLOAT_STENCIL8 | TEXTURE_COMPRESSION_BC | TEXTURE_COMPRESSION_BC_SLICED_3D | TIMESTAMP_QUERY | INDIRECT_FIRST_INSTANCE | SHADER_F16 | RG11B10UFLOAT_RENDERABLE | BGRA8UNORM_STORAGE | FLOAT32_FILTERABLE | FLOAT32_BLENDABLE | DUAL_SOURCE_BLENDING | CLIP_DISTANCES | IMMEDIATES | PRIMITIVE_INDEX) } }) } => AdapterInfo { name: "Tesla T10x", vendor: 4318, device: 7735, device_type: DiscreteGpu, device_pci_bus_id: "0000:04:00.0", driver: "NVIDIA", driver_info: "580.178.04", backend: Vulkan, subgroup_min_size: 32, subgroup_max_size: 32, transient_saves_memory: false }
+[2026-09-26T12:50:54Z INFO  fpga_st_train::train] teacher loaded in 0.59 s
+[2026-09-26T12:50:54Z INFO  fpga_st_train::train] style branch precomputed (fixed style, alpha fixed at 1.0)
+[2026-09-26T12:50:54Z INFO  cubecl_runtime::tune::tune_cache] Load autotune cache ...
+[2026-09-26T12:50:54Z INFO  cubecl_runtime::tune::tune_cache] Loaded 62 autotune cached entries
+[2026-09-26T12:50:54Z INFO  cubecl_runtime::tune::tuner] Tuning ConvAutotuneKey { kernel_size: [1, 1], stride: [1, 1], padding: [0, 0], dilation: [1, 1], groups: 1, in_channels: 32, out_channels: 32, shape: [128, 256], batch_size: 1, has_bias: true, dtype: F32, lhs_shape_align: 0, lhs_stride_align: 0, rhs_shape_align: 2, rhs_stride_align: 2 }
+[2026-09-26T12:50:54Z INFO  cubecl_runtime::tune::tune_cache] Load autotune cache ...
+[2026-09-26T12:50:54Z INFO  cubecl_runtime::tune::tune_cache] Loaded 23 autotune cached entries
+[2026-09-26T12:50:56Z INFO  cubecl_runtime::tune::tuner] Tuning ConvAutotuneKey { kernel_size: [1, 1], stride: [1, 1], padding: [0, 0], dilation: [1, 1], groups: 1, in_channels: 64, out_channels: 64, shape: [64, 128], batch_size: 1, has_bias: true, dtype: F32, lhs_shape_align: 0, lhs_stride_align: 0, rhs_shape_align: 2, rhs_stride_align: 2 }
+[2026-09-26T12:50:56Z INFO  cubecl_runtime::tune::tune_cache] Load autotune cache ...
+[2026-09-26T12:50:56Z INFO  cubecl_runtime::tune::tune_cache] Loaded 12 autotune cached entries
+[2026-09-26T12:50:57Z INFO  fpga_st_train::train] student: WgpuRuntime, f32, i32, u8>>>> (51635 parameters)
+training 'vangogh_dw' for 4000 steps: batch 4, crop 192, device d1, loss = 1*L1 + 2*gradL1 + 0*TV
+[2026-09-26T12:51:01Z INFO  cubecl_runtime::tune::tune_cache] Load autotune cache ...
+[2026-09-26T12:51:01Z INFO  cubecl_runtime::tune::tune_cache] Loaded 14 autotune cached entries
+[2026-09-26T12:51:01Z INFO  cubecl_runtime::tune::tune_cache] Load autotune cache ...
+[2026-09-26T12:51:01Z INFO  cubecl_runtime::tune::tune_cache] Loaded 11 autotune cached entries
+[2026-09-26T12:51:01Z INFO  cubecl_runtime::tune::tune_cache] Load autotune cache ...
+[2026-09-26T12:51:01Z INFO  cubecl_runtime::tune::tune_cache] Loaded 15 autotune cached entries
+step     100/4000    loss   0.44005  l1 0.30453  grad 0.06776  feat 0.00000  tv 0.00000  lr 6.000e-4  0.98 step/s  102.4 s
+step     200/4000    loss   0.25098  l1 0.11754  grad 0.06672  feat 0.00000  tv 0.00000  lr 6.000e-4  1.01 step/s  198.8 s
+step     300/4000    loss   0.23515  l1 0.10253  grad 0.06631  feat 0.00000  tv 0.00000  lr 6.000e-4  1.02 step/s  295.1 s
+step     400/4000    loss   0.23077  l1 0.09968  grad 0.06555  feat 0.00000  tv 0.00000  lr 6.000e-4  1.02 step/s  391.3 s
+step     500/4000    loss   0.22391  l1 0.09333  grad 0.06529  feat 0.00000  tv 0.00000  lr 6.000e-4  1.03 step/s  487.4 s
+  sample     500 animal       lapvar 0.00011  checker 1.699e-7  sat 0.128  psnr_vs_teacher 19.27 dB  lapvar_t 0.00554
+  sample     500 cat          lapvar 0.00005  checker 3.935e-7  sat 0.126  psnr_vs_teacher 19.55 dB  lapvar_t 0.00532
+  sample     500 city         lapvar 0.00002  checker 8.225e-7  sat 0.126  psnr_vs_teacher 18.17 dB  lapvar_t 0.00605
+step     600/4000    loss   0.21999  l1 0.09040  grad 0.06480  feat 0.00000  tv 0.00000  lr 6.000e-4  1.02 step/s  589.8 s
+step     700/4000    loss   0.21696  l1 0.08863  grad 0.06417  feat 0.00000  tv 0.00000  lr 6.000e-4  1.02 step/s  686.0 s
+step     800/4000    loss   0.21525  l1 0.08778  grad 0.06373  feat 0.00000  tv 0.00000  lr 6.000e-4  1.02 step/s  782.2 s
+step     900/4000    loss   0.21076  l1 0.08432  grad 0.06322  feat 0.00000  tv 0.00000  lr 6.000e-4  1.02 step/s  878.4 s
+step    1000/4000    loss   0.21003  l1 0.08402  grad 0.06301  feat 0.00000  tv 0.00000  lr 6.000e-4  1.03 step/s  974.6 s
+  sample    1000 animal       lapvar 0.00033  checker 1.149e-7  sat 0.125  psnr_vs_teacher 20.47 dB  lapvar_t 0.00554
+  sample    1000 cat          lapvar 0.00013  checker 4.029e-7  sat 0.122  psnr_vs_teacher 20.13 dB  lapvar_t 0.00532
+  sample    1000 city         lapvar 0.00007  checker 6.682e-7  sat 0.123  psnr_vs_teacher 18.81 dB  lapvar_t 0.00605
+step    1100/4000    loss   0.20647  l1 0.08175  grad 0.06236  feat 0.00000  tv 0.00000  lr 6.000e-4  1.03 step/s  1070.9 s
