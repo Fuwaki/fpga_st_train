@@ -341,7 +341,9 @@ impl<B: Backend> StudentModel<B> for TinyStudent<B> {
     fn intermediate(&self, content: Tensor<B, 4>) -> (Tensor<B, 4>, Vec<Tensor<B, 4>>) {
         self.intermediates(content)
     }
+}
 
+impl<B: Backend> quant::Quantizable<B> for TinyStudent<B> {
     fn forward_quantised(
         &self,
         content: Tensor<B, 4>,
@@ -356,7 +358,6 @@ impl<B: Backend> StudentModel<B> for TinyStudent<B> {
 
     fn observe_activations(&self, content: Tensor<B, 4>, observe: &mut dyn FnMut(usize, f32)) {
         self.forward_core(content, None, |point, x| {
-            // One device sync per point per batch: fine for a calibration-only pass.
             observe(point, x.clone().abs().max().into_scalar().to_f64() as f32);
         });
     }

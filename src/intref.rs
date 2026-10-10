@@ -232,22 +232,39 @@ impl IntModel {
         let plane = out_h * out_w;
         let mut out = vec![0i32; oc_n * plane];
 
+        let depthwise = layer.groups > 1;
         out.par_chunks_mut(plane).enumerate().for_each(|(oc, dst)| {
-            let base = layer.weight_offset + oc * ic_n * kh * kw;
             let requant = layer.requant[oc];
             let bias = layer.bias_int32[oc] as i64;
+            let base = if depthwise {
+                layer.weight_offset + oc * kh * kw
+            } else {
+                layer.weight_offset + oc * ic_n * kh * kw
+            };
             for oy in 0..out_h {
                 for ox in 0..out_w {
                     let mut acc = bias;
-                    for ic in 0..ic_n {
-                        let src = ic * phw;
-                        let wgt = base + ic * kh * kw;
+                    if depthwise {
+                        let src = oc * phw;
                         for ky in 0..kh {
                             let row = (oy * sh + ky) * padded.w + ox * sw;
                             for kx in 0..kw {
                                 let a = padded.data[src + row + kx] as i64;
-                                let b = self.weights[wgt + ky * kw + kx] as i64;
+                                let b = self.weights[base + ky * kw + kx] as i64;
                                 acc += a * b;
+                            }
+                        }
+                    } else {
+                        for ic in 0..ic_n {
+                            let src = ic * phw;
+                            let wgt = base + ic * kh * kw;
+                            for ky in 0..kh {
+                                let row = (oy * sh + ky) * padded.w + ox * sw;
+                                for kx in 0..kw {
+                                    let a = padded.data[src + row + kx] as i64;
+                                    let b = self.weights[wgt + ky * kw + kx] as i64;
+                                    acc += a * b;
+                                }
                             }
                         }
                     }

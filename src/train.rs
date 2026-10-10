@@ -21,14 +21,16 @@ use crate::backend::{InferBackend, TrainBackend, TrainDevice, select_device};
 use crate::config::{Config, OptimConfig, Schedule};
 use crate::data::dataset::{PairDataset, load_pair_cropped};
 use crate::data::{
-    image_paths, load_rgb, resize_long_edge, resize_short_edge, rgb_to_tensor, save_rgb,
+    image_paths, load_rgb, resize_long_edge, rgb_to_tensor, save_rgb,
     tensor_to_rgb,
 };
 use crate::eval;
 use crate::losses;
+use crate::run_log::{RunLog, RunProvenance, SampleMetrics, TrainStepMetrics, ValStepMetrics};
+use crate::quant::Quantizable;
 use crate::student::StudentModel;
+use crate::supervision::Supervision;
 use crate::teacher::Stylizer;
-use crate::teacher::weights;
 
 /// Learning-rate schedule wrapper.
 ///
@@ -86,12 +88,12 @@ pub fn save_checkpoint<B: Backend, M: Module<B>>(model: &M, path: PathBuf) -> Re
 }
 
 /// One batch of content and its supervision, built by sampling the dataset.
-struct Batch {
-    content: Tensor<TrainBackend, 4>,
+pub(crate) struct Batch {
+    pub(crate) content: Tensor<TrainBackend, 4>,
     target: Option<Tensor<TrainBackend, 4>>,
 }
 
-fn build_batch(
+pub(crate) fn build_batch(
     dataset: &PairDataset,
     crop: u32,
     batch: usize,
@@ -132,118 +134,141 @@ pub fn load_checkpoint<M: Module<TrainBackend>>(
         .map_err(|e| anyhow::anyhow!("cannot load {}: {e}", path.display()))
 }
 
-/// Everything the calibration pass needs, independent of how the model was trained.
-///
-/// Calibration only looks at activation ranges, so it needs real content crops and nothing
-/// else: no optimiser, no teacher, not even the training config.
-#[derive(Debug, Clone)]
-pub struct CalibrationJob {
-    /// Folder of content images.
-    pub content_dir: PathBuf,
-    /// Random crop size fed to the network. Must be a multiple of 4.
-    pub crop: usize,
-    /// Images per batch.
-    pub batch_size: usize,
-    /// RNG seed, so calibrating the same model twice gives identical scales.
-    pub seed: u64,
-    /// How many batches to measure.
-    pub batches: usize,
-    /// Multiplier applied to the observed maxima before dividing by the code maximum.
-    /// 1.0 keeps every observed activation representable.
-    pub safety: f32,
+/// Fixed seed for the held-out val batch (same crops on every `val_every` step).
+const VAL_BATCH_SEED: u64 = 0x5641_4C5F9E37_79B9;
+
+#[derive(Clone, Copy)]
+struct LossWeights {
+    pixel: f32,
+    gradient: f32,
+    stroke: f32,
+    feature: f32,
+    tv: f32,
 }
 
-impl Default for CalibrationJob {
-    fn default() -> Self {
-        Self {
-            content_dir: PathBuf::from("data/content"),
-            crop: 192,
-            batch_size: 4,
-            seed: 0,
-            batches: 20,
-            safety: 1.0,
+struct LossParts<B: Backend> {
+    total: Tensor<B, 1>,
+    pixel: Tensor<B, 1>,
+    gradient: Option<Tensor<B, 1>>,
+    stroke: Option<Tensor<B, 1>>,
+    feature: Option<Tensor<B, 1>>,
+    tv: Option<Tensor<B, 1>>,
+}
+
+impl<B: Backend> LossParts<B> {
+    fn train_metrics(&self, lr: f64, steps_per_s: Option<f64>) -> TrainStepMetrics {
+        TrainStepMetrics {
+            loss: self.total.clone().into_scalar().to_f64(),
+            lr,
+            steps_per_s,
+            l1: Some(self.pixel.clone().into_scalar().to_f64()),
+            gradient: self.gradient.as_ref().map(|t| t.clone().into_scalar().to_f64()),
+            stroke: self.stroke.as_ref().map(|t| t.clone().into_scalar().to_f64()),
+            feature: self.feature.as_ref().map(|t| t.clone().into_scalar().to_f64()),
+            tv: self.tv.as_ref().map(|t| t.clone().into_scalar().to_f64()),
+        }
+    }
+
+    fn val_metrics(&self) -> ValStepMetrics {
+        ValStepMetrics {
+            loss: self.total.clone().into_scalar().to_f64(),
+            l1: Some(self.pixel.clone().into_scalar().to_f64()),
+            gradient: self.gradient.as_ref().map(|t| t.clone().into_scalar().to_f64()),
+            stroke: self.stroke.as_ref().map(|t| t.clone().into_scalar().to_f64()),
+            feature: self.feature.as_ref().map(|t| t.clone().into_scalar().to_f64()),
+            tv: self.tv.as_ref().map(|t| t.clone().into_scalar().to_f64()),
         }
     }
 }
 
-/// Measure the activation range at every quantised point of a trained student.
-///
-/// Returns symmetric scales (absmax * safety / code_max) for the requested bit widths. This is
-/// the whole of the post-training recipe: the ranges depend only on the weights, so a handful
-/// of content batches is enough.
-pub fn calibrate<M, F>(
-    job: &CalibrationJob,
-    arch: &str,
-    build_student: F,
-    device: &TrainDevice,
-    checkpoint: &std::path::Path,
-    bits: crate::quant::Bits,
-) -> Result<crate::quant::Calibration>
-where
-    M: StudentModel<TrainBackend> + AutodiffModule<TrainBackend>,
-    M::InnerModule: StudentModel<<TrainBackend as AutodiffBackend>::InnerBackend>,
-    F: FnOnce(&TrainDevice) -> Result<M>,
-{
-    let mut rng = StdRng::seed_from_u64(job.seed);
-    let dataset = PairDataset::build(&job.content_dir, None, None)?;
+fn forward_loss<B: Backend, M: StudentModel<B> + Quantizable<B>>(
+    model: &M,
+    content: Tensor<B, 4>,
+    target: Tensor<B, 4>,
+    teacher_feats: &[Tensor<B, 4>],
+    feature_scales: &[f32],
+    weights: &LossWeights,
+    quant_scheme: Option<&crate::quant::QuantScheme>,
+) -> LossParts<B> {
+    let (output, student_feats) = match quant_scheme {
+        Some(scheme) => (model.forward_quantised(content, scheme), Vec::new()),
+        None => model.intermediate(content),
+    };
 
-    let model = load_checkpoint(build_student(device)?, checkpoint, device)?;
-    let points = model.quant_points();
-    if points.is_empty() {
-        bail!("this student has no quantised points (StudentModel::quant_points is empty)");
-    }
-    // Inference only: skip the autodiff machinery entirely.
-    let model = model.valid();
-    log::info!(
-        "calibrating {} quantised points for {} on {} batches of {}x{} crops",
-        points.len(),
-        bits.label(),
-        job.batches,
-        job.batch_size,
-        job.crop
-    );
+    let pixel = losses::l1(output.clone(), target.clone());
+    let mut total = pixel.clone().mul_scalar(weights.pixel);
+    let mut gradient = None;
+    let mut stroke = None;
+    let mut feature = None;
+    let mut tv = None;
 
-    let mut absmax = vec![0.0f32; points.len()];
-    for step in 1..=job.batches {
-        let batch = build_batch(&dataset, job.crop as u32, job.batch_size, &mut rng, device)?;
-        model.observe_activations(batch.content.valid(), &mut |point, value| {
-            if value > absmax[point] {
-                absmax[point] = value;
-            }
-        });
-        if step % 5 == 0 || step == job.batches {
-            log::info!("calibrated {step}/{} batches", job.batches);
+    if weights.feature > 0.0
+        && !student_feats.is_empty()
+        && student_feats.len() == teacher_feats.len()
+    {
+        let stages = student_feats.len() as f32;
+        let mut acc: Option<Tensor<B, 1>> = None;
+        for ((student, teacher), scale) in student_feats
+            .iter()
+            .zip(teacher_feats)
+            .zip(feature_scales.iter())
+        {
+            let stage = (student.clone() - teacher.clone())
+                .abs()
+                .mean()
+                .div_scalar(*scale);
+            acc = Some(match acc {
+                None => stage,
+                Some(prev) => prev + stage,
+            });
+        }
+        if let Some(acc) = acc {
+            let term = acc.div_scalar(stages);
+            feature = Some(term.clone());
+            total = total + term.mul_scalar(weights.feature);
         }
     }
 
-    let scales: Vec<f32> = absmax
-        .iter()
-        .map(|m| (m * job.safety) / bits.act_max())
-        .map(|s| s.max(1e-5))
-        .collect();
-    Ok(crate::quant::Calibration {
-        arch: arch.to_owned(),
-        points,
-        scales,
-        absmax,
-        safety: job.safety,
-        batches: job.batches,
-        bits,
-    })
+    if weights.gradient > 0.0 {
+        let term = losses::gradient_l1(output.clone(), target.clone());
+        gradient = Some(term.clone());
+        total = total + term.mul_scalar(weights.gradient);
+    }
+    if weights.stroke > 0.0 {
+        let term = losses::stroke_l1(output.clone(), target);
+        stroke = Some(term.clone());
+        total = total + term.mul_scalar(weights.stroke);
+    }
+    if weights.tv > 0.0 {
+        let term = losses::total_variation(output);
+        tv = Some(term.clone());
+        total = total + term.mul_scalar(weights.tv);
+    }
+
+    LossParts {
+        total,
+        pixel,
+        gradient,
+        stroke,
+        feature,
+        tv,
+    }
 }
 
-/// Run training. build_student constructs the concrete model (see main.rs).
-pub fn run<M, F>(config: Config, build_student: F) -> Result<()>
+/// Run training. `build_student` constructs the concrete model (see [crate::registry]).
+pub fn run<M, F>(config: Config, provenance: RunProvenance, build_student: F) -> Result<()>
 where
-    M: StudentModel<TrainBackend> + AutodiffModule<TrainBackend>,
-    M::InnerModule: StudentModel<<TrainBackend as AutodiffBackend>::InnerBackend>,
+    M: StudentModel<TrainBackend> + Quantizable<TrainBackend> + AutodiffModule<TrainBackend>,
+    M::InnerModule:
+        StudentModel<<TrainBackend as AutodiffBackend>::InnerBackend> + Quantizable<InferBackend>,
     F: FnOnce(&crate::config::StudentConfig, &TrainDevice) -> Result<M>,
 {
     config.validate()?;
     let device = select_device(&config.run.device);
 
-    std::fs::create_dir_all(&config.run.output_dir)
-        .with_context(|| format!("cannot create {}", config.run.output_dir.display()))?;
+    let mut run_log = RunLog::open(&config.run.output_dir, &config, &provenance)?;
+    log::info!("metrics -> {}", run_log.path().display());
+
     // Make the run directory self-describing: the inference tool rebuilds the architecture from
     // this card instead of being handed the training config it came from.
     crate::config::ModelCard::of(&config.student)
@@ -269,27 +294,7 @@ where
     let crop = config.data.crop as u32;
     let batch = config.data.batch_size;
 
-    // ---- teacher ---------------------------------------------------------------------
-    // The style branch is a constant for a fixed style, so it is precomputed once here
-    // instead of being recomputed on every step (see teacher::stylizer).
-    let teacher: Option<Stylizer> = if config.teacher.enabled {
-        let started = Instant::now();
-        let model = weights::load(&config.teacher.weights_dir, &device)
-            .context("failed to load the MicroAST teacher")?;
-        log::info!("teacher loaded in {:.2} s", started.elapsed().as_secs_f32());
-        let img = load_rgb(&config.teacher.style)
-            .with_context(|| format!("cannot load style {}", config.teacher.style.display()))?;
-        let img = resize_short_edge(
-            &img,
-            config.teacher.style_size as u32,
-            image::imageops::FilterType::Triangle,
-        );
-        let style = rgb_to_tensor::<InferBackend>(&img, &device);
-        log::info!("style branch precomputed (fixed style, alpha fixed at 1.0)");
-        Some(Stylizer::new(model, style))
-    } else {
-        None
-    };
+    let supervision = Supervision::try_from_config(&config, &device)?;
 
     // ---- model / optimiser -----------------------------------------------------------
     let mut model: M = build_student(&config.student, &device)?;
@@ -307,11 +312,15 @@ where
         .init::<TrainBackend, M>();
     let mut schedule = LrSchedule::build(&config.optim)?;
 
-    let pixel_weight = config.loss.pixel;
-    let gradient_weight = config.loss.gradient;
-    let feature_weight = config.loss.feature;
-    let tv_weight = config.loss.tv;
-    if feature_weight > 0.0 && teacher.is_none() {
+    let loss_weights = LossWeights {
+        pixel: config.loss.pixel,
+        gradient: config.loss.gradient,
+        stroke: config.loss.stroke,
+        feature: config.loss.feature,
+        tv: config.loss.tv,
+    };
+    let feature_weight = loss_weights.feature;
+    if feature_weight > 0.0 && supervision.teacher().is_none() {
         bail!(
             "loss.feature > 0 requires teacher.enabled = true (feature distillation is teacher-guided)"
         );
@@ -324,13 +333,14 @@ where
     }
 
     println!(
-        "training '{}' for {} steps: batch {batch}, crop {crop}, device {}, loss = {}*L1 + {}*gradL1 + {}*TV",
+        "training '{}' for {} steps: batch {batch}, crop {crop}, device {}, loss = {}*L1 + {}*gradL1 + {}*stroke + {}*TV",
         config.run.name,
         config.optim.iterations,
         config.run.device,
-        pixel_weight,
-        gradient_weight,
-        tv_weight,
+        loss_weights.pixel,
+        loss_weights.gradient,
+        loss_weights.stroke,
+        loss_weights.tv,
     );
     if feature_weight > 0.0 {
         println!("feature distillation: weight {feature_weight} over the teacher decoder stages");
@@ -340,9 +350,9 @@ where
     // absolute activation, so the three stages contribute comparably regardless of scale.
     // Measured once up front, which also keeps the training step free of device syncs.
     let feature_scales: Vec<f32> = if feature_weight > 0.0 {
-        let teacher = teacher.as_ref().expect("checked above");
+        let teacher = supervision.teacher().expect("checked above");
         let probe = build_batch(&dataset, crop, batch, &mut rng, &device)?;
-        let probe = Tensor::<InferBackend, 4>::from_data(probe.content.into_data(), &device);
+        let probe = probe.content.inner();
         let (_, feats) = teacher.features(probe);
         let scales: Vec<f32> = feats
             .iter()
@@ -363,22 +373,12 @@ where
             anyhow::anyhow!("quant.enabled = true requires quant.calibration (run the 'calibrate' subcommand first)")
         })?;
         let calibration = crate::quant::Calibration::load(path)?;
-        let expected = model.quant_points();
-        if expected.is_empty() {
-            bail!("this student has no quantised points (StudentModel::quant_points is empty)");
-        }
-        if calibration.scales.len() != expected.len() {
-            bail!(
-                "{} has {} activation scales but the model has {} quantised points",
-                path.display(),
-                calibration.scales.len(),
-                expected.len()
-            );
-        }
+        calibration.validate_for(&model)?;
+        let n_act = model.quant_points().len();
         println!(
             "low-bit QAT: {} ({} activation points, image scale {:.5}, largest scale {:.4})",
             calibration.bits.label(),
-            expected.len(),
+            n_act,
             calibration.scales[0],
             calibration.scales.iter().cloned().fold(0.0f32, f32::max)
         );
@@ -416,143 +416,89 @@ where
         out
     };
 
+    let val_batch_size = config.run.val_batch_size.max(1);
+    let mut val_rng = StdRng::seed_from_u64(config.run.seed ^ VAL_BATCH_SEED);
+
     // ---- loop ------------------------------------------------------------------------
     let started = Instant::now();
-    let mut window_loss = 0.0f64;
-    let mut window_pixel = 0.0f64;
-    let mut window_gradient = 0.0f64;
-    let mut window_feature = 0.0f64;
-    let mut window_tv = 0.0f64;
-    let mut window_count = 0usize;
+    let mut last_train_metrics: Option<TrainStepMetrics> = None;
 
     for step in 1..=config.optim.iterations {
         let batch_data = build_batch(&dataset, crop, batch, &mut rng, &device)?;
         let content = batch_data.content;
-        let provided_target = batch_data.target;
+        let (target, teacher_feats) = supervision.resolve_batch(
+            content.clone(),
+            batch_data.target,
+            feature_weight > 0.0,
+        )?;
 
-        // A single teacher pass per step supplies both the pseudo ground truth and (when
-        // feature distillation is on) the intermediate features the student is matched to.
-        let teacher_input: Option<Tensor<InferBackend, 4>> = if teacher.is_some() {
-            Some(Tensor::<InferBackend, 4>::from_data(
-                content.clone().into_data(),
-                &device,
-            ))
-        } else {
-            None
-        };
-        let (teacher_out, teacher_feats): (
-            Option<Tensor<InferBackend, 4>>,
-            Vec<Tensor<InferBackend, 4>>,
-        ) = match (&teacher, &teacher_input) {
-            (Some(teacher), Some(input)) if provided_target.is_none() || feature_weight > 0.0 => {
-                let (out, feats) = teacher.features(input.clone());
-                (
-                    Some(out),
-                    if feature_weight > 0.0 {
-                        feats
-                    } else {
-                        Vec::new()
-                    },
-                )
-            }
-            _ => (None, Vec::new()),
-        };
+        let parts = forward_loss(
+            &model,
+            content,
+            target,
+            &teacher_feats,
+            &feature_scales,
+            &loss_weights,
+            quant_scheme.as_ref(),
+        );
+        let loss = parts.total.clone();
 
-        let target = match (provided_target, teacher_out) {
-            (Some(target), _) => target,
-            (None, Some(out)) => Tensor::<TrainBackend, 4>::from_data(out.into_data(), &device),
-            (None, None) => bail!(
-                "some samples have no pseudo ground truth and the teacher is disabled -- \
-                 generate targets with the 'stylize' subcommand, or set teacher.enabled = true"
-            ),
-        };
-        let teacher_feats: Vec<Tensor<TrainBackend, 4>> = teacher_feats
-            .into_iter()
-            .map(|f| Tensor::<TrainBackend, 4>::from_data(f.into_data(), &device))
-            .collect();
-
-        let (output, student_feats) = match &quant_scheme {
-            Some(scheme) => (model.forward_quantised(content, scheme), Vec::new()),
-            None => model.intermediate(content),
-        };
-        let pixel = losses::l1(output.clone(), target.clone());
-        let pixel_value = pixel.clone().into_scalar().to_f64();
-        let mut loss = pixel.mul_scalar(pixel_weight);
-
-        // Feature-level distillation: match the student's decoder stages to the teacher's,
-        // which is where the brush texture actually lives (plain output L1 cannot ask for it
-        // -- the L1 optimum is the conditional mean, i.e. a blurred picture).
-        let mut feature_value = 0.0f64;
-        if feature_weight > 0.0
-            && !student_feats.is_empty()
-            && student_feats.len() == teacher_feats.len()
-        {
-            let stages = student_feats.len() as f32;
-            let mut total: Option<Tensor<TrainBackend, 1>> = None;
-            for ((student, teacher), scale) in student_feats
-                .into_iter()
-                .zip(teacher_feats)
-                .zip(feature_scales.iter())
-            {
-                let stage = (student - teacher).abs().mean().div_scalar(*scale);
-                total = Some(match total {
-                    None => stage,
-                    Some(acc) => acc + stage,
-                });
-            }
-            if let Some(total) = total {
-                let term = total.div_scalar(stages);
-                feature_value = term.clone().into_scalar().to_f64();
-                loss = loss + term.mul_scalar(feature_weight);
-            }
-        }
-
-        let mut gradient_value = 0.0f64;
-        if gradient_weight > 0.0 {
-            let term = losses::gradient_l1(output.clone(), target);
-            gradient_value = term.clone().into_scalar().to_f64();
-            loss = loss + term.mul_scalar(gradient_weight);
-        }
-        let mut tv_value = 0.0f64;
-        if tv_weight > 0.0 {
-            let term = losses::total_variation(output);
-            tv_value = term.clone().into_scalar().to_f64();
-            loss = loss + term.mul_scalar(tv_weight);
-        }
-        let loss_value = loss.clone().into_scalar().to_f64();
+        // Avoid per-step `into_scalar` GPU→CPU sync (hurts Gen1/x4 PCIe badly).
+        let log_this = config.run.log_every > 0 && step % config.run.log_every == 0;
 
         let grads = GradientsParams::from_grads(loss.backward(), &model);
         let lr = schedule.next();
         model = optimiser.step(lr, model, grads);
 
-        window_loss += loss_value;
-        window_pixel += pixel_value;
-        window_gradient += gradient_value;
-        window_feature += feature_value;
-        window_tv += tv_value;
-        window_count += 1;
-
-        if config.run.log_every > 0 && step % config.run.log_every == 0 {
+        if log_this {
             let elapsed = started.elapsed().as_secs_f64();
-            let n = window_count.max(1) as f64;
+            let metrics = parts.train_metrics(lr, Some(step as f64 / elapsed.max(1e-9)));
+            last_train_metrics = Some(metrics.clone());
             println!(
-                "step {step:>7}/{:<7} loss {:>9.5}  l1 {:.5}  grad {:.5}  feat {:.5}  tv {:.5}  lr {:.3e}  {:.2} step/s  {:.1} s",
+                "step {step:>7}/{:<7} loss {:>9.5}  l1 {:.5}  grad {:.5}  stroke {:.5}  feat {:.5}  tv {:.5}  lr {:.3e}  {:.2} step/s  {:.1} s",
                 config.optim.iterations,
-                window_loss / n,
-                window_pixel / n,
-                window_gradient / n,
-                window_feature / n,
-                window_tv / n,
-                lr,
-                step as f64 / elapsed.max(1e-9),
+                metrics.loss,
+                metrics.l1.unwrap_or(0.0),
+                metrics.gradient.unwrap_or(0.0),
+                metrics.stroke.unwrap_or(0.0),
+                metrics.feature.unwrap_or(0.0),
+                metrics.tv.unwrap_or(0.0),
+                metrics.lr,
+                metrics.steps_per_s.unwrap_or(0.0),
                 elapsed,
             );
-            window_loss = 0.0;
-            window_pixel = 0.0;
-            window_gradient = 0.0;
-            window_feature = 0.0;
-            window_tv = 0.0;
-            window_count = 0;
+            run_log.train_step(step, metrics)?;
+        }
+
+        let val_this = config.run.val_every > 0 && step % config.run.val_every == 0;
+        if val_this {
+            let val_data = build_batch(&dataset, crop, val_batch_size, &mut val_rng, &device)?;
+            let (val_target, val_teacher_feats) = supervision.resolve_batch(
+                val_data.content.clone(),
+                val_data.target,
+                feature_weight > 0.0,
+            )?;
+            let valid = model.valid();
+            let val_teacher_inner: Vec<Tensor<InferBackend, 4>> = val_teacher_feats
+                .iter()
+                .map(|t| t.clone().inner())
+                .collect();
+            let val_parts = forward_loss(
+                &valid,
+                val_data.content.inner(),
+                val_target.inner(),
+                &val_teacher_inner,
+                &feature_scales,
+                &loss_weights,
+                quant_scheme.as_ref(),
+            );
+            let val_metrics = val_parts.val_metrics();
+            println!(
+                "  val {step:>7} loss {:>9.5}  l1 {:.5}",
+                val_metrics.loss,
+                val_metrics.l1.unwrap_or(0.0),
+            );
+            run_log.val_step(step, val_metrics)?;
         }
         if config.run.checkpoint_every > 0 && step % config.run.checkpoint_every == 0 {
             save_checkpoint(
@@ -562,16 +508,19 @@ where
         }
         if config.run.sample_every > 0 && step % config.run.sample_every == 0 {
             for (name, img) in &sample_images {
-                if let Err(e) = sample(
+                match sample(
                     &model,
                     img,
                     name,
-                    teacher.as_ref(),
+                    supervision.teacher(),
                     &config.run.output_dir,
                     step,
                     &device,
                 ) {
-                    log::warn!("could not write sample '{name}' at step {step}: {e}");
+                    Ok(metrics) => run_log.sample_eval(step, name, metrics)?,
+                    Err(e) => {
+                        log::warn!("could not write sample '{name}' at step {step}: {e}");
+                    }
                 }
             }
         }
@@ -581,9 +530,11 @@ where
     // so predict/infer/gallery scripts can point straight at runs/<tag>.
     let final_path = config.run.output_dir.join("model.mpk");
     save_checkpoint(&model, final_path.clone())?;
+    let wall_s = started.elapsed().as_secs_f64();
+    run_log.run_end(config.optim.iterations, wall_s, last_train_metrics)?;
     println!(
         "done in {:.1} s -> {}",
-        started.elapsed().as_secs_f32(),
+        wall_s,
         final_path.display()
     );
     Ok(())
@@ -600,36 +551,61 @@ fn sample<M>(
     output_dir: &std::path::Path,
     step: usize,
     device: &TrainDevice,
-) -> Result<()>
+) -> Result<SampleMetrics>
 where
     M: AutodiffModule<TrainBackend>,
     M::InnerModule: StudentModel<<TrainBackend as AutodiffBackend>::InnerBackend>,
 {
     let valid = model.valid();
-    let content = rgb_to_tensor::<InferBackend>(image, device);
+    // Same contract as infer: stride-2 down and nearest up only round-trip when both
+    // edges are multiples of 4. The H/2 skip adds those two tensors, so a 270-wide
+    // sample (enc → 135, trunk up → 136) panics. Pad, then crop the metrics back.
+    let (w, h) = image.dimensions();
+    let padded = crate::data::pad_to_multiple(image, 4);
+    let content = rgb_to_tensor::<InferBackend>(&padded, device);
     let styled = valid.stylize(content.clone());
-    let out = tensor_to_rgb(styled)?;
+    let mut out = tensor_to_rgb(styled)?;
+    if (w, h) != padded.dimensions() {
+        out = image::imageops::crop_imm(&out, 0, 0, w, h).to_image();
+    }
     let path = output_dir.join(format!("sample_{step:06}_{name}.png"));
     save_rgb(&out, &path)?;
 
+    let lapvar = eval::lapvar(&out);
+    let checkerboard = eval::checkerboard(&out);
+    let saturation = eval::saturation(&out);
+    let mut metrics = SampleMetrics {
+        lapvar,
+        checkerboard,
+        saturation,
+        psnr_vs_teacher: None,
+        lapvar_teacher: None,
+    };
     let mut line = format!(
         "  sample {step:>7} {name:<12} lapvar {:.5}  checker {:.3e}  sat {:.3}",
-        eval::lapvar(&out),
-        eval::checkerboard(&out),
-        eval::saturation(&out),
+        lapvar,
+        checkerboard,
+        saturation,
     );
     if let Some(teacher) = teacher {
-        let target = tensor_to_rgb(teacher.stylize(content))?;
+        let mut target = tensor_to_rgb(teacher.stylize(content))?;
+        if (w, h) != padded.dimensions() {
+            target = image::imageops::crop_imm(&target, 0, 0, w, h).to_image();
+        }
         save_rgb(
             &target,
             output_dir.join(format!("target_{step:06}_{name}.png")),
         )?;
+        let psnr = eval::psnr(&out, &target)?;
+        let lapvar_t = eval::lapvar(&target);
+        metrics.psnr_vs_teacher = Some(psnr);
+        metrics.lapvar_teacher = Some(lapvar_t);
         line.push_str(&format!(
             "  psnr_vs_teacher {:>5.2} dB  lapvar_t {:.5}",
-            eval::psnr(&out, &target)?,
-            eval::lapvar(&target),
+            psnr,
+            lapvar_t,
         ));
     }
     println!("{line}");
-    Ok(())
+    Ok(metrics)
 }

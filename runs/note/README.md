@@ -15,7 +15,7 @@
 | 路径 | 内容 |
 |---|---|
 | `configs/<风格>.json` | 一次训练的全部超参数（唯一需要 config 的地方） |
-| `runs/log/<风格>.log` | 该次训练完整 stdout（`scripts/train.sh` 落盘） |
+| `runs/log/<风格>.log` | 该次训练完整 stdout（`scripts/ train.sh` 落盘） |
 | `runs/<风格>/model.json` | 架构 + 选项 + 元信息（**自我描述**） |
 | `runs/<风格>/model.mpk` | 最终 fp32 权重 |
 | `runs/<风格>/step_*.mpk` | 周期性检查点 |

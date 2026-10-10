@@ -1,0 +1,54 @@
+{
+  "run": {
+    "name": "bench_t10_pcie_minsync",
+    "output_dir": "/tmp/st_bench_t10_out2",
+    "seed": 0,
+    "device": "d1",
+    "log_every": 40,
+    "checkpoint_every": 0,
+    "sample_every": 0,
+    "sample_content": null,
+    "sample_size": 384
+  },
+  "data": {
+    "content_dir": "/tmp/st_bench_content",
+    "pseudo_gt_dir": "/tmp/st_bench_targets",
+    "crop": 128,
+    "batch_size": 4,
+    "limit": null
+  },
+  "teacher": {
+    "weights_dir": "../../teacher-eval/MicroAST/models",
+    "style": "../../style-transfer/data/styles/ink/fankuan.jpg",
+    "style_size": 256,
+    "alpha": 1,
+    "enabled": false
+  },
+  "loss": {
+    "pixel": 1.0,
+    "gradient": 0.0,
+    "feature": 0.0,
+    "tv": 0.0,
+    "perceptual": 0,
+    "style": 0,
+    "vgg_weights": null
+  },
+  "optim": {
+    "learning_rate": 0.0006,
+    "beta_1": 0.9,
+    "beta_2": 0.999,
+    "epsilon": 1e-05,
+    "iterations": 40,
+    "schedule": {
+      "kind": "constant"
+    },
+    "grad_clip": null
+  },
+  "student": {
+    "arch": "tiny_dw",
+    "options": {
+      "base": 32,
+      "res_blocks": 4
+    }
+  }
+}

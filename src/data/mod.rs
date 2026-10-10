@@ -19,6 +19,14 @@ pub fn is_image(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// File stem for logging and output names.
+pub fn path_stem(path: &Path) -> String {
+    path.file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("image")
+        .to_owned()
+}
+
 /// Sorted list of image files directly inside a directory, or the single path itself.
 pub fn image_paths(path: impl AsRef<Path>) -> Result<Vec<PathBuf>> {
     let path = path.as_ref();
@@ -141,15 +149,21 @@ pub fn pad_to_multiple(img: &RgbImage, m: u32) -> RgbImage {
 }
 
 /// RGB8 to [1, 3, H, W] f32 in [0, 1].
+///
+/// Packs on the host from the contiguous RGB8 buffer (no per-pixel `get_pixel`), then a
+/// single `from_data` upload. On a Gen1/Gen3 x4 link the upload size dominates; avoiding
+/// extra host work keeps the CPU from serialising behind PCIe.
 pub fn rgb_to_tensor<B: Backend>(img: &RgbImage, device: &B::Device) -> Tensor<B, 4> {
     let (w, h) = (img.width() as usize, img.height() as usize);
-    let mut data = Vec::with_capacity(3 * h * w);
-    for channel in 0..3 {
-        for y in 0..h {
-            for x in 0..w {
-                data.push(img.get_pixel(x as u32, y as u32)[channel] as f32 / 255.0);
-            }
-        }
+    let raw = img.as_raw();
+    let plane = h * w;
+    let mut data = vec![0f32; 3 * plane];
+    // Interleaved RGB8 -> planar CHW f32.
+    for i in 0..plane {
+        let o = i * 3;
+        data[i] = raw[o] as f32 * (1.0 / 255.0);
+        data[plane + i] = raw[o + 1] as f32 * (1.0 / 255.0);
+        data[2 * plane + i] = raw[o + 2] as f32 * (1.0 / 255.0);
     }
     Tensor::from_data(TensorData::new(data, [1, 3, h, w]), device)
 }

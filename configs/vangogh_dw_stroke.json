@@ -1,0 +1,55 @@
+{
+  "run": {
+    "name": "vangogh_dw_stroke",
+    "output_dir": "../runs/vangogh_dw_stroke",
+    "seed": 0,
+    "device": "d1",
+    "log_every": 100,
+    "checkpoint_every": 2000,
+    "sample_every": 500,
+    "sample_content": "../../style-transfer/demo_inputs",
+    "sample_size": 384
+  },
+  "data": {
+    "content_dir": "../../style-transfer/data/content",
+    "pseudo_gt_dir": null,
+    "crop": 192,
+    "batch_size": 4,
+    "limit": null
+  },
+  "teacher": {
+    "weights_dir": "../../teacher-eval/MicroAST/models",
+    "style": "../../style-transfer/data/styles/vangogh/starry_night.jpg",
+    "style_size": 256,
+    "alpha": 1,
+    "enabled": true
+  },
+  "loss": {
+    "pixel": 1,
+    "gradient": 0,
+    "stroke": 4,
+    "feature": 0,
+    "tv": 0,
+    "perceptual": 0,
+    "style": 0,
+    "vgg_weights": null
+  },
+  "optim": {
+    "learning_rate": 0.0006,
+    "beta_1": 0.9,
+    "beta_2": 0.999,
+    "epsilon": 0.00001,
+    "iterations": 1000,
+    "schedule": {
+      "kind": "constant"
+    },
+    "grad_clip": null
+  },
+  "student": {
+    "arch": "tiny_dw",
+    "options": {
+      "base": 32,
+      "res_blocks": 4
+    }
+  }
+}

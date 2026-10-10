@@ -232,6 +232,25 @@ pub struct Calibration {
 }
 
 impl Calibration {
+    /// Check that scales match the model's quantised activation layout.
+    pub fn validate_for<B: Backend, M: crate::quant::Quantizable<B>>(
+        &self,
+        model: &M,
+    ) -> anyhow::Result<()> {
+        let points = model.quant_points();
+        if points.is_empty() {
+            anyhow::bail!("model does not implement quantisation (empty quant_points)");
+        }
+        if points.len() != self.scales.len() {
+            anyhow::bail!(
+                "calibration has {} scales but the model has {} quantised points",
+                self.scales.len(),
+                points.len()
+            );
+        }
+        Ok(())
+    }
+
     pub fn load(path: &std::path::Path) -> anyhow::Result<Self> {
         let text = std::fs::read_to_string(path)
             .map_err(|e| anyhow::anyhow!("cannot read {}: {e}", path.display()))?;
@@ -261,6 +280,10 @@ impl Calibration {
     }
 }
 
+fn default_groups() -> usize {
+    1
+}
+
 /// One convolution of the exported integer graph, in execution order.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuantLayer {
@@ -270,6 +293,9 @@ pub struct QuantLayer {
     pub op: String,
     pub in_channels: usize,
     pub out_channels: usize,
+    /// 1 for a dense convolution; `in_channels` for depthwise.
+    #[serde(default = "default_groups")]
+    pub groups: usize,
     pub act_bits: u8,
     pub weight_bits: u8,
     /// Always 0: the code range is symmetric about zero (or `[0, 2^bits-1]` when

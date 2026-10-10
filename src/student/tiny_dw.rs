@@ -5,6 +5,15 @@
 //! 1x1. On hardware the depthwise stage is one MAC per channel per tap; the pointwise stage
 //! is a small 1x1 mixer. Both map cleanly onto a line-buffer datapath without grouped or
 //! transposed convolutions beyond depthwise.
+//!
+//! One additive skip, at 1/2 resolution only. The H/4 trunk is where the style is mixed,
+//! and it is also where content edges die: two stride-2 layers leave the decoder a 4 px
+//! grid, which is enough for a tint and not enough to place a stroke. `enc[0]` is already
+//! 64 channels at H/2, the same shape as the upsampled trunk, so the skip is an add.
+//! No concatenation, no extra convolution, no new parameters. A full-resolution skip
+//! is left out: the stem is 32 channels at full resolution, twice the bytes of this
+//! 64-channel H/2 map, and the brush strokes on the Van Gogh teacher correlate over
+//! 4–8 px, which the H/2 map can still locate.
 
 use burn::module::Module;
 use burn::nn::PaddingConfig2d;
@@ -320,19 +329,31 @@ impl<B: Backend> TinyDwStudent<B> {
         };
         h = relu(self.stem.forward_with(h, stem_w));
 
-        for block in &self.enc {
-            h = block.forward_quant(
-                h,
-                point,
-                point + 1,
-                scheme,
-                &mut observe,
-                wq_dw(&block.dw, scheme),
-                wq_pw(&block.pw, scheme),
-                true,
-            );
-            point += 2;
-        }
+        // enc[0] is the H/2 map. It is kept for the decoder skip; enc[1] is what
+        // actually enters the H/4 bottleneck.
+        h = self.enc[0].forward_quant(
+            h,
+            point,
+            point + 1,
+            scheme,
+            &mut observe,
+            wq_dw(&self.enc[0].dw, scheme),
+            wq_pw(&self.enc[0].pw, scheme),
+            true,
+        );
+        point += 2;
+        let half_skip = h.clone();
+        h = self.enc[1].forward_quant(
+            h,
+            point,
+            point + 1,
+            scheme,
+            &mut observe,
+            wq_dw(&self.enc[1].dw, scheme),
+            wq_pw(&self.enc[1].pw, scheme),
+            true,
+        );
+        point += 2;
 
         let trunk_base = point;
         for (r, block) in self.res.iter().enumerate() {
@@ -376,7 +397,18 @@ impl<B: Backend> TinyDwStudent<B> {
         }
 
         let dec_base = trunk_base + 4 * self.res.len();
-        h = upsample2x(h);
+        let up = upsample2x(h);
+        // Same grid as the next convolution's input, matching the residual add:
+        // both operands are requantised onto up3.0.dw.in, then that point observes the sum.
+        h = match scheme {
+            Some(scheme) => {
+                let scale = scheme.acts[dec_base];
+                let qmax = scheme.act_max();
+                quant::fake_quant_act(up, scale, qmax)
+                    + quant::fake_quant_act(half_skip, scale, qmax)
+            }
+            None => up + half_skip,
+        };
 
         h = qa(h, scheme, dec_base, &mut observe);
         h = self.up3[0].forward_quant(
@@ -427,15 +459,15 @@ impl<B: Backend> TinyDwStudent<B> {
 
     fn intermediates(&self, content: Tensor<B, 4>) -> (Tensor<B, 4>, Vec<Tensor<B, 4>>) {
         let mut h = relu(self.stem.forward(content));
-        for block in &self.enc {
-            h = block.forward(h);
-        }
+        h = self.enc[0].forward(h);
+        let half_skip = h.clone();
+        h = self.enc[1].forward(h);
         for block in &self.res {
             h = block.forward(h);
         }
         let trunk = h.clone();
 
-        h = upsample2x(h);
+        h = upsample2x(h) + half_skip;
         h = self.up3[0].forward(h);
         h = relu(self.up1[0].forward(h));
         let half = h.clone();
@@ -457,7 +489,9 @@ impl<B: Backend> StudentModel<B> for TinyDwStudent<B> {
     fn intermediate(&self, content: Tensor<B, 4>) -> (Tensor<B, 4>, Vec<Tensor<B, 4>>) {
         self.intermediates(content)
     }
+}
 
+impl<B: Backend> quant::Quantizable<B> for TinyDwStudent<B> {
     fn forward_quantised(
         &self,
         content: Tensor<B, 4>,
@@ -518,7 +552,7 @@ mod tests {
             + sep3(fine, 3);
 
         assert_eq!(tiny, 376_595);
-        assert_eq!(tiny_dw, 51_667);
+        assert_eq!(tiny_dw, 51_635);
         assert!(tiny_dw < tiny);
     }
 }

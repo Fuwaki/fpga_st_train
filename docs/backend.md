@@ -154,3 +154,44 @@ time, invocation count, % of total) for the run. That is how the
 `DirectConv2dKernel` / 67% figure above was obtained; use the same method
 rather than trusting wall-clock prints, which include CPU-side data loading
 and (for `stylize`) image encode/decode that have nothing to do with the GPU.
+
+## PCIe / T10 host↔device traffic (2026-10-10)
+
+Tesla T10 on this box often trains at **PCIe Gen1–3 x4** (Vega56 is Gen3 x16). Prefer
+`--device d1` with a **vulkan** build (`cargo build --release --no-default-features --features vulkan`).
+`d0` = Vega (RADV), `d1` = T10 (NVIDIA). `CUDA_VISIBLE_DEVICES` does not apply to burn/wgpu.
+
+### What hurt on x4
+
+1. **`into_data()` teacher↔student copies** every step (full activation tensors over PCIe).
+2. **Per-step `into_scalar()`** logging (GPU sync / tiny readbacks that stall the queue).
+3. **Re-decoding PNG/JPEG every crop** on the CPU before each upload.
+
+### Mitigations (in tree)
+
+- `Tensor::from_inner` / `.inner()` for teacher outputs (stay on GPU).
+- Defer `into_scalar` to `log_every` boundaries.
+- Process-wide decoded-image cache in `data::dataset`.
+- Faster CHW pack in `rgb_to_tensor` (still one H2D upload per image).
+
+### Bench (vulkan, d1=T10, tiny_dw, batch4, crop128, 40 steps, no teacher)
+
+| build | wall | cumulative step/s @40 | notes |
+|------:|-----:|----------------------:|-------|
+| before | 38.6 s | 1.04 | per-step scalar syncs, no image cache |
+| after (log_every=10) | 22.1 s | 1.81 | ~1.75× wall |
+| after (log_every=40) | 21.9 s | 1.82 | |
+
+Steady-state steps 20→40 stay ~2.3–2.4 step/s once autotune is warm (compute-bound);
+the big win is cold start + removing sync/decode overhead. With **online teacher**, avoiding
+`into_data` roundtrips is the dominant PCIe saving (full NCHW maps twice per step).
+
+### Roundtrip microbench (`examples/pcie_roundtrip.rs`, 16 MiB f32)
+
+| adapter | into_data↔from_data | on-device add | ratio |
+|---------|--------------------:|--------------:|------:|
+| d1 T10 (x4) | 29.3 ms (~1.15 GB/s 2-way) | 0.44 ms | 66× |
+| d0 Vega56 | 14.3 ms (~2.34 GB/s 2-way) | 0.27 ms | 53× |
+
+Keeping teacher/student tensors on-GPU (`from_inner`) avoids that 29 ms/activation bounce on T10.
+

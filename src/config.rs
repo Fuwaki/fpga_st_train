@@ -106,9 +106,14 @@ impl Config {
         if self.optim.iterations == 0 {
             bail!("optim.iterations must be positive");
         }
-        let student_is_identity =
-            self.loss.pixel == 0.0 && self.loss.perceptual == 0.0 && self.loss.style == 0.0;
-        if student_is_identity {
+        let no_signal = self.loss.pixel == 0.0
+            && self.loss.gradient == 0.0
+            && self.loss.stroke == 0.0
+            && self.loss.feature == 0.0
+            && self.loss.tv == 0.0
+            && self.loss.perceptual == 0.0
+            && self.loss.style == 0.0;
+        if no_signal {
             bail!("every loss term is zero -- the model would learn nothing");
         }
         Ok(())
@@ -126,6 +131,10 @@ pub struct RunConfig {
     /// The --device command line flag overrides this.
     pub device: String,
     pub log_every: usize,
+    /// Fixed-batch validation loss on `model.valid()` (0 = disabled).
+    pub val_every: usize,
+    /// Content images in the fixed val batch (same random crops every time).
+    pub val_batch_size: usize,
     pub checkpoint_every: usize,
     pub sample_every: usize,
     /// Image or folder used to render progress samples. Falls back to the first
@@ -146,6 +155,8 @@ impl Default for RunConfig {
             seed: 0,
             device: "default".into(),
             log_every: 20,
+            val_every: 0,
+            val_batch_size: 4,
             checkpoint_every: 500,
             sample_every: 250,
             sample_content: None,
@@ -222,6 +233,9 @@ pub struct LossConfig {
     pub pixel: f32,
     /// L1 between the finite-difference gradients of output and target.
     pub gradient: f32,
+    /// Band-pass L1 at 3–9 px and 9–25 px. Asks for brush strokes without the
+    /// 1 px conditional-mean trap of `gradient`. 0 disables it.
+    pub stroke: f32,
     /// Feature-level distillation: per-layer L1 between the student's and the teacher's
     /// decoder feature maps, normalised by each layer's mean magnitude. 0 disables it.
     pub feature: f32,
@@ -240,6 +254,7 @@ impl Default for LossConfig {
         Self {
             pixel: 1.0,
             gradient: 0.0,
+            stroke: 0.0,
             feature: 0.0,
             tv: 1e-4,
             perceptual: 0.0,
@@ -295,7 +310,7 @@ pub enum Schedule {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct StudentConfig {
-    /// Which architecture to build. Consumed by build_student in main.rs.
+    /// Which architecture to build. Dispatched in [crate::registry].
     pub arch: String,
     /// Architecture-specific options, so new models need no config changes.
     pub options: serde_json::Value,
@@ -345,7 +360,7 @@ impl StudentConfig {
 /// produced the model. That is what makes a delivered directory runnable on its own.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelCard {
-    /// Which architecture to build. Consumed by build_student in main.rs.
+    /// Which architecture to build. Dispatched in [crate::registry].
     pub arch: String,
     /// Architecture-specific options, exactly as they appear in the training config.
     #[serde(default)]

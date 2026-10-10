@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, bail};
 use image::RgbImage;
@@ -9,6 +10,26 @@ use image::imageops::FilterType;
 use rand::Rng;
 
 use super::{image_paths, load_rgb, resize_short_edge};
+
+/// Process-wide decode cache. Training re-samples the same files every step; on a narrow
+/// PCIe link we cannot afford to also re-decode PNG/JPEG on the CPU every iteration.
+fn image_cache() -> &'static Mutex<HashMap<PathBuf, Arc<RgbImage>>> {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, Arc<RgbImage>>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn load_rgb_cached(path: &Path) -> Result<Arc<RgbImage>> {
+    {
+        let guard = image_cache().lock().expect("image cache lock");
+        if let Some(img) = guard.get(path) {
+            return Ok(Arc::clone(img));
+        }
+    }
+    let img = Arc::new(load_rgb(path)?);
+    let mut guard = image_cache().lock().expect("image cache lock");
+    Ok(Arc::clone(guard.entry(path.to_path_buf()).or_insert_with(|| Arc::clone(&img))))
+}
 
 /// One training pair.
 #[derive(Debug, Clone)]
@@ -143,11 +164,14 @@ pub fn load_pair_cropped(
     size: u32,
     rng: &mut impl Rng,
 ) -> Result<(RgbImage, Option<RgbImage>)> {
-    let content = load_rgb(&pair.content)
+    let content = load_rgb_cached(&pair.content)
         .with_context(|| format!("cannot load content {}", pair.content.display()))?;
+    let content = (*content).clone();
     let target = match &pair.target {
         Some(path) => {
-            Some(load_rgb(path).with_context(|| format!("cannot load target {}", path.display()))?)
+            let t = load_rgb_cached(path)
+                .with_context(|| format!("cannot load target {}", path.display()))?;
+            Some((*t).clone())
         }
         None => None,
     };
