@@ -10,9 +10,9 @@ use crate::backend::{TrainDevice, select_device};
 use crate::config::ModelCard;
 use crate::data;
 use crate::eval;
+use crate::infer_student::{InferStudent, StudentHandle};
 use crate::intref::IntModel;
 use crate::quant::{Calibration, QuantScheme};
-use crate::infer_student::{InferStudent, StudentHandle};
 
 /// The three ways a delivered model directory can be run.
 pub enum Engine {
@@ -126,8 +126,7 @@ pub fn stylise_contents(
     ext: &str,
 ) -> Result<()> {
     let contents = data::image_paths(content)?;
-    std::fs::create_dir_all(out)
-        .with_context(|| format!("cannot create {}", out.display()))?;
+    std::fs::create_dir_all(out).with_context(|| format!("cannot create {}", out.display()))?;
     log::info!("mode {mode}: {}", engine.describe());
     log::info!("{} content image(s)", contents.len());
 

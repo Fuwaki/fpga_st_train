@@ -1,8 +1,9 @@
 //! FPGA-friendly style transfer: MicroAST teacher inference + distillation training framework.
+#![feature(min_specialization)]
 //!
 //! # Layout
 //!
-//! - [backend]  -- backend and device selection (default: Vulkan on the RX 580)
+//! - [backend]  -- backend and device selection (default: CUDA; vulkan/wgpu are fallbacks)
 //! - [teacher]  -- MicroAST teacher network, ported 1:1 from the official PyTorch release
 //! - [student]  -- the student model contract and the FPGA-oriented tiny student
 //! - [data]     -- image IO, pairing datasets, sampling

@@ -16,13 +16,8 @@ pub fn run(args: ExportInt8Args, device_spec: &str) -> Result<()> {
     let device = select_device(device_spec);
     let calibration = Calibration::load(&args.calibration)?;
 
-    let manifest = registry::export_int8_from_card(
-        &card,
-        &checkpoint,
-        &calibration,
-        &args.out,
-        &device,
-    )?;
+    let manifest =
+        registry::export_int8_from_card(&card, &checkpoint, &calibration, &args.out, &device)?;
 
     card.with_meta("bits", serde_json::Value::String(manifest.bits.label()))
         .with_meta(
@@ -30,7 +25,10 @@ pub fn run(args: ExportInt8Args, device_spec: &str) -> Result<()> {
             serde_json::Value::String(manifest.weight_packing.clone()),
         )
         .with_meta("weight_bytes", serde_json::json!(manifest.weight_bytes))
-        .with_meta("calibration_batches", serde_json::json!(calibration.batches))
+        .with_meta(
+            "calibration_batches",
+            serde_json::json!(calibration.batches),
+        )
         .with_meta("calibration_safety", serde_json::json!(calibration.safety))
         .save(&args.out)?;
     calibration.save(&args.out.join("calibration.json"))?;

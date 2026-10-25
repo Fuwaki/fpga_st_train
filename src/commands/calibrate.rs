@@ -2,8 +2,8 @@ use anyhow::{Result, anyhow};
 
 use fpga_st_train::backend::select_device;
 use fpga_st_train::config::ModelCard;
-use fpga_st_train::registry;
 use fpga_st_train::quant::CalibrationJob;
+use fpga_st_train::registry;
 
 use crate::cli::CalibrateArgs;
 

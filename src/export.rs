@@ -17,8 +17,11 @@ use crate::backend::InferBackend;
 use crate::quant::{
     Bits, Calibration, QuantLayer, QuantManifest, QuantOp, Quantizable, quantise_weights_host,
 };
+use crate::quant::{FilmHead, FilmLayer, InstanceNormLayer};
 use crate::student::TinyDwStudent;
 use crate::student::TinyStudent;
+use crate::student::lut::{LUT_LEAKY_SLOPE, LutDepthwise2d, LutEncoder};
+use crate::student::plugin::{Film, PluginKind, PluginSite};
 use crate::student::tiny::Conv;
 use crate::student::tiny_dw::{DwConv, PwConv};
 
@@ -35,6 +38,11 @@ pub trait Exportable: Quantizable<InferBackend> {
     /// Extra lines appended to manifest.json `notes`.
     fn export_notes(&self, bits: &Bits) -> Vec<String> {
         default_notes(bits)
+    }
+
+    /// Why this graph cannot be lowered yet. `None` means the plan matches the forward.
+    fn export_blocker(&self) -> Option<String> {
+        None
     }
 }
 
@@ -67,6 +75,37 @@ pub enum ExportStep<'a> {
     UpsampleNearest2x { point: usize },
     /// Emit the image: dequantise the head codes with this scale (they are unsigned bytes).
     OutputImage { scale: f32 },
+    /// Depthwise LUT-Conv (truth table per tap); MLP weights are not stored.
+    LutDw {
+        name: String,
+        lut: &'a LutDepthwise2d<InferBackend>,
+        in_point: usize,
+        out_point: usize,
+        in_bits: u8,
+        out_bits: u8,
+        out_scale: f32,
+        post_relu: bool,
+    },
+    /// Spatial InstanceNorm + γ, β on one quantised point (in-place).
+    InstanceNorm {
+        name: String,
+        point: usize,
+        channels: usize,
+        gamma: Vec<f32>,
+        beta: Vec<f32>,
+        out_scale: f32,
+    },
+    /// Global-pool FiLM replacing a same-width 1×1 colour slot.
+    Film {
+        name: String,
+        film: &'a Film<InferBackend>,
+        channels: usize,
+        in_point: usize,
+        out_point: usize,
+        out_scale: f32,
+    },
+    /// Clamp one activation point to `[0, act_qmax]` (decoder ReLU after LUT).
+    ReluPoint { point: usize },
 }
 
 impl ConvRef<'_> {
@@ -301,9 +340,15 @@ impl Exportable for TinyStudent<InferBackend> {
 }
 
 impl Exportable for TinyDwStudent<InferBackend> {
+    fn export_blocker(&self) -> Option<String> {
+        self.blocks_integer_export()
+    }
+
     fn export_plan(&self, scales: &[f32], point_count: usize) -> Vec<ExportStep<'_>> {
         let mut plan = Vec::new();
         let mut point = 1usize;
+        let lut_dw = self.export_lut_dw();
+        let lut_bits = lut_dw.map(|lut| lut.bits()).unwrap_or(8);
 
         plan.push(ExportStep::Conv {
             name: "stem".into(),
@@ -318,15 +363,29 @@ impl Exportable for TinyDwStudent<InferBackend> {
         let mut half_skip_point = 0usize;
         for (i, enc) in self.enc.iter().enumerate() {
             let dw_out = point + 1;
-            plan.push(ExportStep::Conv {
-                name: format!("enc.{i}.dw"),
-                conv: ConvRef::Depthwise(&enc.dw),
-                in_point: point,
-                out_point: dw_out,
-                relu: true,
-                out_scale: scales[dw_out],
-                out_unsigned: false,
-            });
+            if let Some(lut) = lut_dw {
+                let spatial = if i == 0 { &lut.half } else { &lut.trunk };
+                plan.push(ExportStep::LutDw {
+                    name: format!("enc.{i}.dw"),
+                    lut: spatial,
+                    in_point: point,
+                    out_point: dw_out,
+                    in_bits: lut_bits,
+                    out_bits: lut_bits,
+                    out_scale: scales[dw_out],
+                    post_relu: true,
+                });
+            } else {
+                plan.push(ExportStep::Conv {
+                    name: format!("enc.{i}.dw"),
+                    conv: ConvRef::Depthwise(&enc.dw),
+                    in_point: point,
+                    out_point: dw_out,
+                    relu: true,
+                    out_scale: scales[dw_out],
+                    out_unsigned: false,
+                });
+            }
             let pw_out = point + 2;
             plan.push(ExportStep::Conv {
                 name: format!("enc.{i}.pw"),
@@ -390,6 +449,23 @@ impl Exportable for TinyDwStudent<InferBackend> {
         }
 
         let dec_base = trunk_base + 4 * self.res.len();
+        if self.export_plugin_site() == PluginSite::H4
+            && self.export_plugin().kind() == PluginKind::In
+        {
+            let (gamma, beta) = self
+                .export_plugin()
+                .host_instance_norm()
+                .expect("plugin=in")
+                .expect("instance norm γ/β");
+            plan.push(ExportStep::InstanceNorm {
+                name: "plugin.in_h4".into(),
+                point: dec_base,
+                channels: gamma.len(),
+                gamma,
+                beta,
+                out_scale: scales[dec_base],
+            });
+        }
         plan.push(ExportStep::UpsampleNearest2x { point: dec_base });
         plan.push(ExportStep::ResidualAdd {
             point: dec_base,
@@ -414,15 +490,27 @@ impl Exportable for TinyDwStudent<InferBackend> {
             out_scale: scales[dec_base + 2],
             out_unsigned: false,
         });
-        plan.push(ExportStep::Conv {
-            name: "up1.0".into(),
-            conv: ConvRef::Pointwise(&self.up1[0]),
-            in_point: dec_base + 2,
-            out_point: dec_base + 3,
-            relu: true,
-            out_scale: scales[dec_base + 3],
-            out_unsigned: false,
-        });
+        if let Some(film) = self.export_film_half() {
+            let channels = film.host_heads().0.weight().dims()[1];
+            plan.push(ExportStep::Film {
+                name: "film.half".into(),
+                film,
+                channels,
+                in_point: dec_base + 2,
+                out_point: dec_base + 3,
+                out_scale: scales[dec_base + 3],
+            });
+        } else {
+            plan.push(ExportStep::Conv {
+                name: "up1.0".into(),
+                conv: ConvRef::Pointwise(&self.up1[0]),
+                in_point: dec_base + 2,
+                out_point: dec_base + 3,
+                relu: true,
+                out_scale: scales[dec_base + 3],
+                out_unsigned: false,
+            });
+        }
 
         plan.push(ExportStep::UpsampleNearest2x {
             point: dec_base + 3,
@@ -445,15 +533,27 @@ impl Exportable for TinyDwStudent<InferBackend> {
             out_scale: scales[dec_base + 5],
             out_unsigned: false,
         });
-        plan.push(ExportStep::Conv {
-            name: "up1.1".into(),
-            conv: ConvRef::Pointwise(&self.up1[1]),
-            in_point: dec_base + 5,
-            out_point: dec_base + 6,
-            relu: true,
-            out_scale: scales[dec_base + 6],
-            out_unsigned: false,
-        });
+        if let Some(film) = self.export_film_full() {
+            let channels = film.host_heads().0.weight().dims()[1];
+            plan.push(ExportStep::Film {
+                name: "film.full".into(),
+                film,
+                channels,
+                in_point: dec_base + 5,
+                out_point: dec_base + 6,
+                out_scale: scales[dec_base + 6],
+            });
+        } else {
+            plan.push(ExportStep::Conv {
+                name: "up1.1".into(),
+                conv: ConvRef::Pointwise(&self.up1[1]),
+                in_point: dec_base + 5,
+                out_point: dec_base + 6,
+                relu: true,
+                out_scale: scales[dec_base + 6],
+                out_unsigned: false,
+            });
+        }
 
         plan.push(ExportStep::Conv {
             name: "head.dw".into(),
@@ -514,12 +614,36 @@ impl Int8Exporter {
     }
 }
 
+const INSTANCE_NORM_EPS: f32 = 1e-5;
+
+fn export_film_head(pw: &PwConv<InferBackend>, in_scale: f32, qmax: f32) -> Result<FilmHead> {
+    let [out_ch, in_ch, _, _] = pw.weight().dims();
+    let weight = tensor_to_vec(&pw.weight())?;
+    let (codes, scales) = quantise_weights_host(&weight, out_ch, qmax);
+    let bias = read_bias(pw.conv.bias.as_ref())?;
+    let bias_int32: Vec<i32> = bias
+        .iter()
+        .zip(&scales)
+        .map(|(b, w)| (b / (in_scale * w)).round() as i32)
+        .collect();
+    Ok(FilmHead {
+        in_channels: in_ch,
+        out_channels: out_ch,
+        weight_scale: scales,
+        weight_codes: codes,
+        bias_int32,
+    })
+}
+
 /// Write weights.bin and manifest.json for a model under dir.
 pub fn export_int8<M: Exportable>(
     model: &M,
     calibration: &Calibration,
     dir: &Path,
 ) -> Result<QuantManifest> {
+    if let Some(why) = model.export_blocker() {
+        bail!("{why}");
+    }
     let points = model.quant_points();
     if points.len() != calibration.scales.len() {
         bail!(
@@ -535,6 +659,9 @@ pub fn export_int8<M: Exportable>(
     let mut byte_cursor = 0usize;
     let mut layers: Vec<QuantLayer> = Vec::new();
     let mut graph: Vec<QuantOp> = Vec::new();
+    let mut lut_layers: Vec<crate::quant::LutLayer> = Vec::new();
+    let mut norm_layers: Vec<InstanceNormLayer> = Vec::new();
+    let mut film_layers: Vec<FilmLayer> = Vec::new();
     let per_byte = (8 / bits.weights) as usize;
 
     for step in &steps {
@@ -649,6 +776,105 @@ pub fn export_int8<M: Exportable>(
                     scale: Some(*scale),
                 });
             }
+            ExportStep::LutDw {
+                name,
+                lut,
+                in_point,
+                out_point,
+                in_bits,
+                out_bits,
+                out_scale,
+                post_relu,
+            } => {
+                let in_scale = calibration.scales[*in_point];
+                let mut layer =
+                    lut.to_manifest_layer(name, *in_bits, *out_bits, in_scale, LUT_LEAKY_SLOPE)?;
+                layer.next_in_scale = *out_scale;
+                layer.post_relu = *post_relu;
+                lut_layers.push(layer);
+                graph.push(QuantOp {
+                    op: "lut_conv2d".to_owned(),
+                    layer: Some(name.clone()),
+                    point: Some(*out_point),
+                    source_point: Some(*in_point),
+                    scale: Some(in_scale),
+                });
+                if *post_relu {
+                    graph.push(QuantOp {
+                        op: "relu_point".to_owned(),
+                        layer: None,
+                        point: Some(*out_point),
+                        source_point: None,
+                        scale: None,
+                    });
+                }
+            }
+            ExportStep::InstanceNorm {
+                name,
+                point,
+                channels,
+                gamma,
+                beta,
+                out_scale,
+            } => {
+                norm_layers.push(InstanceNormLayer {
+                    name: name.clone(),
+                    point: *point,
+                    channels: *channels,
+                    in_scale: calibration.scales[*point],
+                    out_scale: *out_scale,
+                    eps: INSTANCE_NORM_EPS,
+                    gamma: gamma.clone(),
+                    beta: beta.clone(),
+                });
+                graph.push(QuantOp {
+                    op: "instance_norm".to_owned(),
+                    layer: Some(name.clone()),
+                    point: Some(*point),
+                    source_point: None,
+                    scale: Some(*out_scale),
+                });
+            }
+            ExportStep::Film {
+                name,
+                film,
+                channels,
+                in_point,
+                out_point,
+                out_scale,
+            } => {
+                let in_scale = calibration.scales[*in_point];
+                let hidden = (channels / 4).max(1);
+                let (reduce, gamma, beta) = film.host_heads();
+                film_layers.push(FilmLayer {
+                    name: name.clone(),
+                    channels: *channels,
+                    hidden,
+                    in_point: *in_point,
+                    out_point: *out_point,
+                    in_scale,
+                    out_scale: *out_scale,
+                    reduce: export_film_head(reduce, in_scale, bits.weight_max())?,
+                    gamma: export_film_head(gamma, in_scale, bits.weight_max())?,
+                    beta: export_film_head(beta, in_scale, bits.weight_max())?,
+                });
+                graph.push(QuantOp {
+                    op: "film".to_owned(),
+                    layer: Some(name.clone()),
+                    point: Some(*out_point),
+                    source_point: Some(*in_point),
+                    scale: Some(*out_scale),
+                });
+            }
+            ExportStep::ReluPoint { point } => {
+                graph.push(QuantOp {
+                    op: "relu_point".to_owned(),
+                    layer: None,
+                    point: Some(*point),
+                    source_point: None,
+                    scale: None,
+                });
+            }
         }
     }
 
@@ -668,9 +894,83 @@ pub fn export_int8<M: Exportable>(
         weight_file: "weights.bin".to_owned(),
         weight_packing: format!("i{}-x{}", bits.weights, 8 / bits.weights),
         weight_bytes,
+        lut_layers,
+        norm_layers,
+        film_layers,
     };
     manifest
         .save(dir, &blob)
         .with_context(|| format!("cannot write the export to {}", dir.display()))?;
+    Ok(manifest)
+}
+
+/// Write a LUT-Conv stack into `manifest.json`.
+///
+/// Each logical LUT becomes one row of the symmetric codebook already used for
+/// activations: input code `+1` means `input_scale` in real units, and a channel
+/// is the integer sum of the looked-up codes times that layer's `out_scale`.
+/// The MLP weights are not stored. `weights.bin` is empty.
+///
+/// The next layer's input scale is the previous layer's `next_in_scale`, which
+/// fits the worst-case integer sum into the same signed range. The tiny_dw
+/// training path does not use that scale: [LutEncoder::forward_dw] snaps the
+/// real sum onto [crate::student::lut::LUT_CODE_SPAN] before the decoder.
+pub fn export_lut_encoder<B: Backend>(
+    encoder: &LutEncoder<B>,
+    dir: &Path,
+    in_bits: u8,
+    out_bits: u8,
+    input_scale: f32,
+) -> Result<QuantManifest> {
+    let mut lut_layers = Vec::with_capacity(encoder.layers.len());
+    let mut points = vec!["input".to_owned()];
+    let mut point_scales = vec![input_scale];
+    let mut graph = Vec::with_capacity(encoder.layers.len());
+    let mut in_scale = input_scale;
+    for (index, conv) in encoder.layers.iter().enumerate() {
+        let name = format!("enc.{index}");
+        let layer = conv.to_manifest_layer(&name, in_bits, out_bits, in_scale, LUT_LEAKY_SLOPE)?;
+        points.push(name.clone());
+        point_scales.push(layer.next_in_scale);
+        graph.push(QuantOp {
+            op: "lut_conv2d".to_owned(),
+            layer: Some(name),
+            point: Some(index + 1),
+            source_point: Some(index),
+            scale: Some(in_scale),
+        });
+        in_scale = layer.next_in_scale;
+        lut_layers.push(layer);
+    }
+
+    let manifest = QuantManifest {
+        format: "fpga_st_train.lut.v1".to_owned(),
+        arch: "lut_conv".to_owned(),
+        bits: Bits::new(in_bits, out_bits),
+        act_qmax: Bits::max_value(in_bits),
+        output_qmax: Bits::max_value(out_bits),
+        weight_qmax: Bits::max_value(out_bits),
+        notes: vec![
+            "lut_layers is the truth table of each scalar input. The MLP is not stored.".to_owned(),
+            "index = (input * out_channels + output) * table_len + (code + in_qmax).".to_owned(),
+            "a channel in real units is sum(codes) * out_scale, then leaky_relu when set."
+                .to_owned(),
+            "weights.bin is unused. The integer interpreter executes lut_conv2d from these tables."
+                .to_owned(),
+        ],
+        points,
+        point_scales,
+        graph,
+        layers: Vec::new(),
+        weight_file: "weights.bin".to_owned(),
+        weight_packing: "none".to_owned(),
+        weight_bytes: 0,
+        lut_layers,
+        norm_layers: Vec::new(),
+        film_layers: Vec::new(),
+    };
+    manifest
+        .save(dir, &[])
+        .with_context(|| format!("cannot write the LUT manifest to {}", dir.display()))?;
     Ok(manifest)
 }

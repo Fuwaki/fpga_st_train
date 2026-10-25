@@ -1,0 +1,5 @@
+[env]
+# V100 is sm_70. CUDA 13 nvrtc will not compile that architecture, and the
+# distro nvcc is 13.4, whose PTX driver 580 rejects. Bindings match the CUDA
+# 12.8 nvrtc that scripts/cuda_env.sh puts on the loader path.
+CUDARC_CUDA_VERSION = "12080"

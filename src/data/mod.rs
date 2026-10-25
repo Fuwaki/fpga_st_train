@@ -1,6 +1,8 @@
 //! Image, tensor and dataset IO.
 
 pub mod dataset;
+pub mod hf;
+pub mod train_source;
 
 use std::path::{Path, PathBuf};
 
@@ -82,6 +84,24 @@ pub fn resize_short_edge(img: &RgbImage, size: u32, filter: FilterType) -> RgbIm
     }
     let (nw, nh) = scaled(w, h, size as f64 / short as f64);
     image::imageops::resize(img, nw, nh, filter)
+}
+
+/// One fixed frame for a single-image overfit.
+///
+/// Long edge becomes `long_edge` (Lanczos, same filter as the sample images).
+/// Both edges are then cropped on the bottom and right to a multiple of 8, which
+/// is the stride the guided student and the depthwise H/2 skip both need. The
+/// training batch and the sample metric have to use this same frame, or the
+/// PSNR is measured on pixels the loss never saw.
+pub fn overfit_frame(img: &RgbImage, long_edge: u32) -> RgbImage {
+    let img = resize_long_edge(img, long_edge, FilterType::Lanczos3);
+    let w = (img.width() / 8) * 8;
+    let h = (img.height() / 8) * 8;
+    if w == 0 || h == 0 || (w == img.width() && h == img.height()) {
+        img
+    } else {
+        image::imageops::crop_imm(&img, 0, 0, w, h).to_image()
+    }
 }
 
 /// Resize so the long edge equals size, keeping the aspect ratio.
@@ -168,6 +188,45 @@ pub fn rgb_to_tensor<B: Backend>(img: &RgbImage, device: &B::Device) -> Tensor<B
     Tensor::from_data(TensorData::new(data, [1, 3, h, w]), device)
 }
 
+/// Pack a batch of RGB images into one contiguous CHW tensor and upload it once.
+///
+/// The training loop samples many crops at once. Uploading every crop separately and then
+/// concatenating device tensors adds one host-to-device transfer and one device-side concat
+/// per sample. All crops have the same size, so packing the whole batch here is both cheaper
+/// and gives the backend one larger transfer to schedule.
+pub fn rgb_batch_to_tensor<B: Backend>(imgs: &[RgbImage], device: &B::Device) -> Tensor<B, 4> {
+    let (data, h, w) = rgb_batch_nchw(imgs);
+    let batch = imgs.len();
+    Tensor::from_data(TensorData::new(data, [batch, 3, h, w]), device)
+}
+
+/// Pack a batch into contiguous NCHW f32 in `[0, 1]`, the layout `run_nchw` consumes.
+///
+/// Same bytes as [`rgb_batch_to_tensor`], kept on the host so the ONNX teacher can
+/// start the next batch without a round trip through the training GPU.
+pub fn rgb_batch_nchw(imgs: &[RgbImage]) -> (Vec<f32>, usize, usize) {
+    assert!(
+        !imgs.is_empty(),
+        "rgb_batch_nchw requires a non-empty batch"
+    );
+    let (w, h) = (imgs[0].width() as usize, imgs[0].height() as usize);
+    let plane = h * w;
+    let batch = imgs.len();
+    let mut data = vec![0f32; batch * 3 * plane];
+    for (n, img) in imgs.iter().enumerate() {
+        assert_eq!((img.width() as usize, img.height() as usize), (w, h));
+        let raw = img.as_raw();
+        let base = n * 3 * plane;
+        for i in 0..plane {
+            let o = i * 3;
+            data[base + i] = raw[o] as f32 * (1.0 / 255.0);
+            data[base + plane + i] = raw[o + 1] as f32 * (1.0 / 255.0);
+            data[base + 2 * plane + i] = raw[o + 2] as f32 * (1.0 / 255.0);
+        }
+    }
+    (data, h, w)
+}
+
 /// [1, 3, H, W] f32 to RGB8, clamping to [0, 1].
 pub fn tensor_to_rgb<B: Backend>(tensor: Tensor<B, 4>) -> Result<RgbImage> {
     let [n, c, h, w] = tensor.dims();
@@ -242,4 +301,20 @@ pub fn tensor_to_f32<B: Backend>(tensor: Tensor<B, 4>) -> Result<(Vec<usize>, Ve
         .to_vec::<f32>()
         .map_err(|e| anyhow::anyhow!("cannot read tensor data: {e}"))?;
     Ok((shape, data))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use image::{Rgb, RgbImage};
+
+    #[test]
+    fn overfit_frame_lands_on_a_multiple_of_8() {
+        let img = RgbImage::from_pixel(100, 63, Rgb([10, 20, 30]));
+        let frame = overfit_frame(&img, 80);
+        assert_eq!(frame.width() % 8, 0);
+        assert_eq!(frame.height() % 8, 0);
+        assert!(frame.width() > 0 && frame.height() > 0);
+        assert!(frame.width() <= 80 && frame.height() <= 80);
+    }
 }

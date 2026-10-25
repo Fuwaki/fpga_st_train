@@ -75,6 +75,9 @@ impl Config {
         }
         fix(&mut self.teacher.weights_dir);
         fix(&mut self.teacher.style);
+        if let Some(p) = self.teacher.model.as_mut() {
+            fix(p);
+        }
         if let Some(p) = self.loss.vgg_weights.as_mut() {
             fix(p);
         }
@@ -88,13 +91,28 @@ impl Config {
 
     /// Fail early on obviously wrong configurations, before any model is built.
     pub fn validate(&self) -> Result<()> {
-        if !self.data.content_dir.is_dir() {
-            bail!(
-                "data.content_dir is not a directory: {}",
-                self.data.content_dir.display()
-            );
+        if self.data.hf.is_none() {
+            let path = &self.data.content_dir;
+            let ok = if self.data.overfit_long_edge.is_some() {
+                path.is_file() || path.is_dir()
+            } else {
+                path.is_dir()
+            };
+            if !ok {
+                bail!(
+                    "data.content_dir is not usable: {} (or set data.hf for Hugging Face)",
+                    path.display()
+                );
+            }
         }
-        if self.data.crop == 0 || !self.data.crop.is_multiple_of(4) {
+        if let Some(edge) = self.data.overfit_long_edge {
+            if edge == 0 || !edge.is_multiple_of(8) {
+                bail!("data.overfit_long_edge must be a positive multiple of 8, got {edge}");
+            }
+            if self.data.hf.is_some() {
+                bail!("data.overfit_long_edge cannot be combined with data.hf");
+            }
+        } else if self.data.crop == 0 || !self.data.crop.is_multiple_of(4) {
             bail!(
                 "data.crop must be a positive multiple of 4, got {}",
                 self.data.crop
@@ -108,7 +126,11 @@ impl Config {
         }
         let no_signal = self.loss.pixel == 0.0
             && self.loss.gradient == 0.0
+            && self.loss.flat == 0.0
+            && self.loss.edge == 0.0
+            && self.loss.contrast == 0.0
             && self.loss.stroke == 0.0
+            && self.loss.texture == 0.0
             && self.loss.feature == 0.0
             && self.loss.tv == 0.0
             && self.loss.perceptual == 0.0
@@ -116,8 +138,47 @@ impl Config {
         if no_signal {
             bail!("every loss term is zero -- the model would learn nothing");
         }
+        if self.teacher.enabled {
+            match self.teacher.kind()? {
+                TeacherKind::MicroAst => {
+                    let ckpt = self
+                        .teacher
+                        .weights_dir
+                        .join("content_encoder_iter_160000.pth.tar");
+                    if !ckpt.is_file() {
+                        let dir = display_path(&self.teacher.weights_dir);
+                        bail!(
+                            "MicroAST teacher weights not found at {dir}\n  \
+                             expected file: content_encoder_iter_160000.pth.tar (and three siblings)\n  \
+                             fix: put checkpoints there, or pass --teacher-weights / set TEACHER_WEIGHTS_DIR"
+                        );
+                    }
+                }
+                TeacherKind::RainPrincess | TeacherKind::Whitebox => {
+                    let Some(model) = &self.teacher.model else {
+                        bail!(
+                            "teacher.kind = {:?} requires teacher.model",
+                            self.teacher.kind
+                        );
+                    };
+                    if !model.is_file() {
+                        bail!("teacher model not found: {}", display_path(model));
+                    }
+                }
+            }
+        }
         Ok(())
     }
+}
+
+fn default_sample_limit() -> usize {
+    3
+}
+
+fn display_path(path: &Path) -> String {
+    path.canonicalize()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| path.display().to_string())
 }
 
 /// Where things go and how noisy to be.
@@ -127,8 +188,8 @@ pub struct RunConfig {
     pub name: String,
     pub output_dir: PathBuf,
     pub seed: u64,
-    /// Compute device: "default", "d0" (the RX 580), "i0", "cpu".
-    /// The --device command line flag overrides this.
+    /// Compute device. On the CUDA build, `d0` is nvidia-smi GPU 0.
+    /// The --device command line flag overrides this when it is not `default`.
     pub device: String,
     pub log_every: usize,
     /// Fixed-batch validation loss on `model.valid()` (0 = disabled).
@@ -137,6 +198,10 @@ pub struct RunConfig {
     pub val_batch_size: usize,
     pub checkpoint_every: usize,
     pub sample_every: usize,
+    /// How many images from `sample_content` to render. `0` means every image
+    /// in the folder. Existing configs omit this and keep the old limit of 3.
+    #[serde(default = "default_sample_limit")]
+    pub sample_limit: usize,
     /// Image or folder used to render progress samples. Falls back to the first
     /// training content image when unset.
     pub sample_content: Option<PathBuf>,
@@ -159,9 +224,39 @@ impl Default for RunConfig {
             val_batch_size: 4,
             checkpoint_every: 500,
             sample_every: 250,
+            sample_limit: default_sample_limit(),
             sample_content: None,
             sample_size: 384,
             init_from: None,
+        }
+    }
+}
+
+/// Hugging Face training images (`hf-hub` + parquet shards, cached under `~/.cache/huggingface`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HfDataConfig {
+    /// e.g. `detection-datasets/coco`
+    pub repo: String,
+    /// e.g. `train`
+    pub split: String,
+    /// Git revision on the dataset repo.
+    pub revision: String,
+    /// Cap parquet shards (sorted `data/{split}-*.parquet`). `None` = all shards.
+    pub max_shards: Option<usize>,
+    /// Rows in the full split. Skips the datasets-server `/size` call when set,
+    /// so a later trial can keep the same sampling pool if that host is down.
+    pub num_rows: Option<usize>,
+}
+
+impl Default for HfDataConfig {
+    fn default() -> Self {
+        Self {
+            repo: "detection-datasets/coco".into(),
+            split: "train".into(),
+            revision: "main".into(),
+            max_shards: None,
+            num_rows: None,
         }
     }
 }
@@ -170,13 +265,20 @@ impl Default for RunConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DataConfig {
-    /// Folder of content images.
+    /// Folder of content images (ignored when `hf` is set).
     pub content_dir: PathBuf,
+    /// Load content from Hugging Face instead of `content_dir`.
+    pub hf: Option<HfDataConfig>,
     /// Folder of teacher outputs. Files are matched to content by file stem.
     /// When absent the teacher is run online for every batch.
     pub pseudo_gt_dir: Option<PathBuf>,
     /// Random crop size used for training. Must be a multiple of 4.
+    /// Ignored when `overfit_long_edge` is set.
     pub crop: usize,
+    /// Fit one content image, resized so its long edge is this value and both
+    /// edges are multiples of 8. No random crop. `content_dir` is that image
+    /// (or a folder containing only it). None keeps the normal crop pipeline.
+    pub overfit_long_edge: Option<usize>,
     pub batch_size: usize,
     /// Cap on the number of content images used (None = all).
     pub limit: Option<usize>,
@@ -186,33 +288,94 @@ impl Default for DataConfig {
     fn default() -> Self {
         Self {
             content_dir: PathBuf::from("data/content"),
+            hf: None,
             pseudo_gt_dir: None,
             crop: 256,
+            overfit_long_edge: None,
             batch_size: 4,
             limit: None,
         }
     }
 }
 
-/// The MicroAST teacher.
+/// Which online teacher produces the distillation target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TeacherKind {
+    /// Two-input MicroAST. Needs `weights_dir` and `style`.
+    MicroAst,
+    /// Johnson fast neural style, rain-princess ONNX. Needs `model`.
+    RainPrincess,
+    /// White-box cartoonization ONNX. Needs `model`.
+    Whitebox,
+}
+
+impl TeacherKind {
+    pub fn parse(name: &str) -> Result<Self> {
+        match name {
+            "microast" => Ok(Self::MicroAst),
+            "rain_princess" => Ok(Self::RainPrincess),
+            "whitebox" => Ok(Self::Whitebox),
+            other => {
+                bail!("unknown teacher.kind {other:?}; expected microast, rain_princess, whitebox")
+            }
+        }
+    }
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::MicroAst => "microast",
+            Self::RainPrincess => "rain_princess",
+            Self::Whitebox => "whitebox",
+        }
+    }
+}
+
+/// Online distillation teacher.
+///
+/// `kind` defaults to `microast`, so existing configs keep loading the four
+/// MicroAST checkpoints. `rain_princess` and `whitebox` read an ONNX file from `model`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TeacherConfig {
+    /// `microast`, `rain_princess`, or `whitebox`.
+    pub kind: String,
+    /// ONNX file. Required when `kind` is not `microast`.
+    pub model: Option<PathBuf>,
     /// Directory holding the four *_iter_160000.pth.tar checkpoints.
     pub weights_dir: PathBuf,
-    /// Style image(s) the teacher stylises with.
+    /// Style image the MicroAST teacher stylises with.
     pub style: PathBuf,
     /// Style images are resized so their short edge is this.
     pub style_size: usize,
-    /// Stylisation strength. The released checkpoints only behave at 1.0.
+    /// Stylisation strength. The released MicroAST checkpoints only behave at 1.0.
     pub alpha: f32,
     /// Set false when training purely against pre-generated pseudo ground truth.
     pub enabled: bool,
 }
 
+impl TeacherConfig {
+    pub fn kind(&self) -> Result<TeacherKind> {
+        TeacherKind::parse(&self.kind)
+    }
+
+    /// Label stored on the model card. MicroAST records the style image; ONNX records the file.
+    pub fn style_label(&self) -> String {
+        match self.kind().unwrap_or(TeacherKind::MicroAst) {
+            TeacherKind::MicroAst => self.style.display().to_string(),
+            TeacherKind::RainPrincess | TeacherKind::Whitebox => self
+                .model
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| self.kind.clone()),
+        }
+    }
+}
+
 impl Default for TeacherConfig {
     fn default() -> Self {
         Self {
+            kind: TeacherKind::MicroAst.name().to_owned(),
+            model: None,
             weights_dir: PathBuf::from("models"),
             style: PathBuf::from("style.jpg"),
             style_size: 256,
@@ -233,9 +396,21 @@ pub struct LossConfig {
     pub pixel: f32,
     /// L1 between the finite-difference gradients of output and target.
     pub gradient: f32,
+    /// Extra student gradient where the teacher is flat. 0 disables it.
+    #[serde(default)]
+    pub flat: f32,
+    /// Missing student gradient on teacher edges (3×3 tolerance). 0 disables it.
+    #[serde(default)]
+    pub edge: f32,
+    /// 16×16 window mean and variance. 0 disables it.
+    #[serde(default)]
+    pub contrast: f32,
     /// Band-pass L1 at 3–9 px and 9–25 px. Asks for brush strokes without the
     /// 1 px conditional-mean trap of `gradient`. 0 disables it.
     pub stroke: f32,
+    /// Local band amplitude (4–8 px and 8–16 px). Position inside the window is free.
+    /// 0 disables it.
+    pub texture: f32,
     /// Feature-level distillation: per-layer L1 between the student's and the teacher's
     /// decoder feature maps, normalised by each layer's mean magnitude. 0 disables it.
     pub feature: f32,
@@ -254,7 +429,11 @@ impl Default for LossConfig {
         Self {
             pixel: 1.0,
             gradient: 0.0,
+            flat: 0.0,
+            edge: 0.0,
+            contrast: 0.0,
             stroke: 0.0,
+            texture: 0.0,
             feature: 0.0,
             tv: 1e-4,
             perceptual: 0.0,

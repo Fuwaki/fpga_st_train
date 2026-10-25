@@ -2,17 +2,17 @@
 
 use std::path::Path;
 
-use anyhow::Result;
-use burn::module::AutodiffModule;
-use burn::record::{FullPrecisionSettings, NamedMpkFileRecorder};
 use crate::backend::TrainDevice;
 use crate::config::StudentConfig;
 use crate::export::Exportable;
 use crate::infer_student::StudentHandle;
+use crate::quant::CalibrationJob;
 use crate::quant::{Quantizable, calibrate_activation_ranges};
 use crate::student::StudentModel;
-use crate::quant::CalibrationJob;
 use crate::{InferBackend, TrainBackend};
+use anyhow::Result;
+use burn::module::AutodiffModule;
+use burn::record::{FullPrecisionSettings, NamedMpkFileRecorder};
 
 pub(crate) fn invoke_calibrate<M, F>(
     job: &CalibrationJob,

@@ -3,13 +3,13 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use image::imageops::FilterType;
 
+use fpga_st_train::InferBackend;
 use fpga_st_train::backend::select_device;
 use fpga_st_train::data;
 use fpga_st_train::eval;
 use fpga_st_train::teacher::Teacher;
 use fpga_st_train::teacher::microast::MicroAst;
 use fpga_st_train::teacher::weights;
-use fpga_st_train::InferBackend;
 
 use crate::cli::StylizeArgs;
 

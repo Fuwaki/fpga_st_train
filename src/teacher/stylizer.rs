@@ -102,3 +102,20 @@ impl Stylizer {
         (decoder.up[4].forward(y), vec![trunk, half, full])
     }
 }
+
+impl crate::teacher::DistillTeacher for Stylizer {
+    fn stylize(&self, content: Tensor<InferBackend, 4>) -> anyhow::Result<Tensor<InferBackend, 4>> {
+        Ok(Self::stylize(self, content))
+    }
+
+    fn features(
+        &self,
+        content: Tensor<InferBackend, 4>,
+    ) -> anyhow::Result<(Tensor<InferBackend, 4>, Vec<Tensor<InferBackend, 4>>)> {
+        Ok(Self::features(self, content))
+    }
+
+    fn has_features(&self) -> bool {
+        true
+    }
+}

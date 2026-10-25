@@ -28,7 +28,11 @@ fn load_rgb_cached(path: &Path) -> Result<Arc<RgbImage>> {
     }
     let img = Arc::new(load_rgb(path)?);
     let mut guard = image_cache().lock().expect("image cache lock");
-    Ok(Arc::clone(guard.entry(path.to_path_buf()).or_insert_with(|| Arc::clone(&img))))
+    Ok(Arc::clone(
+        guard
+            .entry(path.to_path_buf())
+            .or_insert_with(|| Arc::clone(&img)),
+    ))
 }
 
 /// One training pair.

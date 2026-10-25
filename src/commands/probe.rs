@@ -5,8 +5,8 @@ use burn::prelude::*;
 use burn::tensor::activation::relu;
 use burn::tensor::ops::{InterpolateMode, InterpolateOptions, PadMode};
 
-use fpga_st_train::backend::select_device;
 use fpga_st_train::InferBackend;
+use fpga_st_train::backend::select_device;
 
 use crate::cli::ProbeArgs;
 

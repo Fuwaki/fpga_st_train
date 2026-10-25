@@ -101,7 +101,12 @@ impl RunLog {
         self.write_map(&m)
     }
 
-    pub fn run_end(&mut self, step: usize, wall_s: f64, final_train: Option<TrainStepMetrics>) -> Result<()> {
+    pub fn run_end(
+        &mut self,
+        step: usize,
+        wall_s: f64,
+        final_train: Option<TrainStepMetrics>,
+    ) -> Result<()> {
         let mut m = Map::new();
         m.insert("kind".into(), Value::String("run_end".into()));
         m.insert("step".into(), json_usize(step));
@@ -145,7 +150,11 @@ pub struct TrainStepMetrics {
     pub steps_per_s: Option<f64>,
     pub l1: Option<f64>,
     pub gradient: Option<f64>,
+    pub flat: Option<f64>,
+    pub edge: Option<f64>,
+    pub contrast: Option<f64>,
     pub stroke: Option<f64>,
+    pub texture: Option<f64>,
     pub feature: Option<f64>,
     pub tv: Option<f64>,
 }
@@ -157,7 +166,11 @@ impl TrainStepMetrics {
         insert_opt_f64(map, "steps_per_s", self.steps_per_s);
         insert_opt_f64(map, "l1", self.l1);
         insert_opt_f64(map, "gradient", self.gradient);
+        insert_opt_f64(map, "flat", self.flat);
+        insert_opt_f64(map, "edge", self.edge);
+        insert_opt_f64(map, "contrast", self.contrast);
         insert_opt_f64(map, "stroke", self.stroke);
+        insert_opt_f64(map, "texture", self.texture);
         insert_opt_f64(map, "feature", self.feature);
         insert_opt_f64(map, "tv", self.tv);
     }
@@ -169,7 +182,11 @@ pub struct ValStepMetrics {
     pub loss: f64,
     pub l1: Option<f64>,
     pub gradient: Option<f64>,
+    pub flat: Option<f64>,
+    pub edge: Option<f64>,
+    pub contrast: Option<f64>,
     pub stroke: Option<f64>,
+    pub texture: Option<f64>,
     pub feature: Option<f64>,
     pub tv: Option<f64>,
 }
@@ -179,7 +196,11 @@ impl ValStepMetrics {
         map.insert("val_loss".into(), json_f64(self.loss));
         insert_opt_f64(map, "val_l1", self.l1);
         insert_opt_f64(map, "val_gradient", self.gradient);
+        insert_opt_f64(map, "val_flat", self.flat);
+        insert_opt_f64(map, "val_edge", self.edge);
+        insert_opt_f64(map, "val_contrast", self.contrast);
         insert_opt_f64(map, "val_stroke", self.stroke);
+        insert_opt_f64(map, "val_texture", self.texture);
         insert_opt_f64(map, "val_feature", self.feature);
         insert_opt_f64(map, "val_tv", self.tv);
     }
@@ -193,6 +214,20 @@ pub struct SampleMetrics {
     pub saturation: f64,
     pub psnr_vs_teacher: Option<f64>,
     pub lapvar_teacher: Option<f64>,
+    /// `lapvar / lapvar_teacher`. 1 means the stroke energy matches.
+    pub lapvar_ratio: Option<f64>,
+    /// Student / teacher mean-square energy in the 4–8 px band.
+    pub energy_4_8: Option<f64>,
+    /// Student / teacher mean-square energy in the 8–16 px band.
+    pub energy_8_16: Option<f64>,
+    /// OLS slope of each student RGB channel on the teacher channel.
+    pub slope_r: Option<f64>,
+    pub slope_g: Option<f64>,
+    pub slope_b: Option<f64>,
+    /// Share of output spatial variance carried by the low-res paint.
+    pub paint_spatial: Option<f64>,
+    /// Fraction of pre-InstanceNorm channels with spatial variance below 1e-5.
+    pub in_dead: Option<f64>,
 }
 
 impl SampleMetrics {
@@ -202,5 +237,13 @@ impl SampleMetrics {
         map.insert("saturation".into(), json_f64(self.saturation));
         insert_opt_f64(map, "psnr_vs_teacher", self.psnr_vs_teacher);
         insert_opt_f64(map, "lapvar_teacher", self.lapvar_teacher);
+        insert_opt_f64(map, "lapvar_ratio", self.lapvar_ratio);
+        insert_opt_f64(map, "energy_4_8", self.energy_4_8);
+        insert_opt_f64(map, "energy_8_16", self.energy_8_16);
+        insert_opt_f64(map, "slope_r", self.slope_r);
+        insert_opt_f64(map, "slope_g", self.slope_g);
+        insert_opt_f64(map, "slope_b", self.slope_b);
+        insert_opt_f64(map, "paint_spatial", self.paint_spatial);
+        insert_opt_f64(map, "in_dead", self.in_dead);
     }
 }

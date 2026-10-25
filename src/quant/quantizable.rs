@@ -10,18 +10,10 @@ pub trait Quantizable<B: Backend> {
     fn quant_points(&self) -> Vec<String>;
 
     /// Fake-quantised forward used during QAT and `sim` inference.
-    fn forward_quantised(
-        &self,
-        content: Tensor<B, 4>,
-        scheme: &QuantScheme,
-    ) -> Tensor<B, 4>;
+    fn forward_quantised(&self, content: Tensor<B, 4>, scheme: &QuantScheme) -> Tensor<B, 4>;
 
     /// Measure per-point activation magnitudes on one batch (calibration pass).
-    fn observe_activations(
-        &self,
-        content: Tensor<B, 4>,
-        observe: &mut dyn FnMut(usize, f32),
-    );
+    fn observe_activations(&self, content: Tensor<B, 4>, observe: &mut dyn FnMut(usize, f32));
 
     fn supports_quant(&self) -> bool {
         !self.quant_points().is_empty()

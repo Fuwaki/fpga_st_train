@@ -6,6 +6,8 @@
 //! [crate::student::StudentModel] -- no TrainStep, no Learner plumbing.
 
 use std::path::PathBuf;
+use std::sync::{Arc, mpsc};
+use std::thread;
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
@@ -13,24 +15,25 @@ use burn::module::AutodiffModule;
 use burn::optim::{AdamConfig, GradientsParams, Optimizer};
 use burn::prelude::*;
 use burn::record::{FullPrecisionSettings, NamedMpkFileRecorder};
-use burn::tensor::backend::AutodiffBackend;
+use burn::tensor::backend::{AutodiffBackend, Backend};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
+use rayon::prelude::*;
 
 use crate::backend::{InferBackend, TrainBackend, TrainDevice, select_device};
 use crate::config::{Config, OptimConfig, Schedule};
-use crate::data::dataset::{PairDataset, load_pair_cropped};
+use crate::data::train_source::TrainContentSource;
 use crate::data::{
-    image_paths, load_rgb, resize_long_edge, rgb_to_tensor, save_rgb,
-    tensor_to_rgb,
+    image_paths, load_rgb, overfit_frame, resize_long_edge, rgb_batch_to_tensor, rgb_to_tensor,
+    save_rgb, tensor_to_rgb,
 };
 use crate::eval;
 use crate::losses;
-use crate::run_log::{RunLog, RunProvenance, SampleMetrics, TrainStepMetrics, ValStepMetrics};
 use crate::quant::Quantizable;
+use crate::run_log::{RunLog, RunProvenance, SampleMetrics, TrainStepMetrics, ValStepMetrics};
 use crate::student::StudentModel;
 use crate::supervision::Supervision;
-use crate::teacher::Stylizer;
+use crate::teacher::DistillTeacher;
 
 /// Learning-rate schedule wrapper.
 ///
@@ -93,33 +96,170 @@ pub(crate) struct Batch {
     target: Option<Tensor<TrainBackend, 4>>,
 }
 
+struct CpuBatch {
+    contents: Vec<image::RgbImage>,
+    targets: Option<Vec<image::RgbImage>>,
+}
+
+fn prepare_cpu_batch(
+    dataset: &TrainContentSource,
+    crop: u32,
+    batch: usize,
+    rng: &mut StdRng,
+) -> Result<CpuBatch> {
+    // Draw seeds in the training thread, then perform decode/resize/crop in parallel. This
+    // keeps the sample sequence deterministic regardless of Rayon scheduling.
+    let seeds: Vec<u64> = (0..batch).map(|_| rand::Rng::random(rng)).collect();
+    let samples: Vec<(image::RgbImage, Option<image::RgbImage>)> = seeds
+        .into_par_iter()
+        .map(|seed| {
+            let mut sample_rng = StdRng::seed_from_u64(seed);
+            dataset.sample_crops(crop, &mut sample_rng)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut contents = Vec::with_capacity(batch);
+    let mut targets = Vec::with_capacity(batch);
+    let mut complete = true;
+    for (content, target) in samples {
+        contents.push(content);
+        match target {
+            Some(target) => targets.push(target),
+            None => complete = false,
+        }
+    }
+    Ok(CpuBatch {
+        contents,
+        targets: complete.then_some(targets),
+    })
+}
+
+/// Next content batch, with the ONNX teacher possibly already running on Vega.
+struct HostAhead {
+    cpu: CpuBatch,
+    pending: Option<mpsc::Receiver<Result<Vec<f32>>>>,
+    ready: Option<Vec<f32>>,
+}
+
+impl HostAhead {
+    /// Wait for Vega if a batch was submitted. Safe to call twice.
+    fn finish(&mut self) -> Result<()> {
+        if let Some(rx) = self.pending.take() {
+            self.ready = Some(rx.recv().context("ONNX teacher thread stopped")??);
+        }
+        Ok(())
+    }
+}
+
+fn launch_host_ahead(
+    rx: &mpsc::Receiver<Result<CpuBatch>>,
+    supervision: &Supervision,
+) -> Result<HostAhead> {
+    let cpu = rx
+        .recv()
+        .context("training data prefetch thread stopped")??;
+    let pending = if cpu.targets.is_none() {
+        supervision.submit_host_batch(&cpu.contents).transpose()?
+    } else {
+        None
+    };
+    Ok(HostAhead {
+        cpu,
+        pending,
+        ready: None,
+    })
+}
+
+fn reclaim_teacher(
+    ahead: &mut Option<HostAhead>,
+    step: usize,
+    iterations: usize,
+    val_every: usize,
+    sample_every: usize,
+) -> Result<()> {
+    let touches_session = (val_every > 0 && step % val_every == 0)
+        || (sample_every > 0 && (step % sample_every == 0 || step == iterations));
+    if touches_session {
+        if let Some(pending) = ahead.as_mut() {
+            pending.finish()?;
+        }
+    }
+    Ok(())
+}
+
+fn host_target_tensor(
+    buf: Vec<f32>,
+    n: usize,
+    h: usize,
+    w: usize,
+    device: &TrainDevice,
+) -> Result<Tensor<TrainBackend, 4>> {
+    let expect = n * 3 * h * w;
+    if buf.len() != expect {
+        bail!(
+            "onnx teacher returned {} values, expected {expect}",
+            buf.len()
+        );
+    }
+    let inner = Tensor::<InferBackend, 4>::from_data(
+        burn::tensor::TensorData::new(buf, [n, 3, h, w]),
+        device,
+    );
+    Ok(Tensor::<TrainBackend, 4>::from_inner(inner))
+}
+
+fn upload_batch(batch: CpuBatch, device: &TrainDevice) -> Batch {
+    Batch {
+        content: rgb_batch_to_tensor::<TrainBackend>(&batch.contents, device),
+        target: batch
+            .targets
+            .as_ref()
+            .map(|targets| rgb_batch_to_tensor::<TrainBackend>(targets, device)),
+    }
+}
+
+/// Teacher output for one step.
+///
+/// An overfit run feeds the same frame every step. The first step runs the
+/// teacher and keeps the inner tensor; later steps wrap a fresh leaf around
+/// that cache. Reusing the autodiff tensor itself would free its graph on the
+/// first backward and leave the rest of the run with an empty gradient.
+fn resolve_step_target(
+    supervision: &crate::supervision::Supervision,
+    content: Tensor<TrainBackend, 4>,
+    provided: Option<Tensor<TrainBackend, 4>>,
+    need_feats: bool,
+    remember: bool,
+    cached: &mut Option<Tensor<InferBackend, 4>>,
+) -> Result<(Tensor<TrainBackend, 4>, Vec<Tensor<TrainBackend, 4>>)> {
+    if remember {
+        if let Some(saved) = cached {
+            return Ok((
+                Tensor::<TrainBackend, 4>::from_inner(saved.clone()),
+                Vec::new(),
+            ));
+        }
+    }
+    let had_target = provided.is_some();
+    let (target, feats) = supervision.resolve_batch(content, provided, need_feats)?;
+    if remember && !had_target && !need_feats {
+        let [_, _, h, w] = target.dims();
+        log::info!("cached overfit teacher target ({h}x{w})");
+        *cached = Some(target.clone().inner());
+    }
+    Ok((target, feats))
+}
+
 pub(crate) fn build_batch(
-    dataset: &PairDataset,
+    dataset: &TrainContentSource,
     crop: u32,
     batch: usize,
     rng: &mut StdRng,
     device: &TrainDevice,
 ) -> Result<Batch> {
-    let mut contents = Vec::with_capacity(batch);
-    let mut targets = Vec::with_capacity(batch);
-    let mut complete = true;
-    for _ in 0..batch {
-        let pair = dataset.sample(rng);
-        let (content_img, target_img) = load_pair_cropped(pair, crop, rng)?;
-        contents.push(rgb_to_tensor::<TrainBackend>(&content_img, device));
-        match target_img {
-            Some(t) => targets.push(rgb_to_tensor::<TrainBackend>(&t, device)),
-            None => complete = false,
-        }
-    }
-    Ok(Batch {
-        content: Tensor::cat(contents, 0),
-        target: if complete {
-            Some(Tensor::cat(targets, 0))
-        } else {
-            None
-        },
-    })
+    Ok(upload_batch(
+        prepare_cpu_batch(dataset, crop, batch, rng)?,
+        device,
+    ))
 }
 
 /// Load a checkpoint saved by [save_checkpoint] into a freshly built student.
@@ -141,16 +281,54 @@ const VAL_BATCH_SEED: u64 = 0x5641_4C5F9E37_79B9;
 struct LossWeights {
     pixel: f32,
     gradient: f32,
+    flat: f32,
+    edge: f32,
+    contrast: f32,
     stroke: f32,
+    texture: f32,
     feature: f32,
     tv: f32,
+}
+
+impl LossWeights {
+    fn from_config(loss: &crate::config::LossConfig) -> Self {
+        Self {
+            pixel: loss.pixel,
+            gradient: loss.gradient,
+            flat: loss.flat,
+            edge: loss.edge,
+            contrast: loss.contrast,
+            stroke: loss.stroke,
+            texture: loss.texture,
+            feature: loss.feature,
+            tv: loss.tv,
+        }
+    }
+
+    fn formula(&self) -> String {
+        format!(
+            "{}*L1 + {}*grad + {}*flat + {}*edge + {}*contrast + {}*stroke + {}*tex + {}*TV",
+            self.pixel,
+            self.gradient,
+            self.flat,
+            self.edge,
+            self.contrast,
+            self.stroke,
+            self.texture,
+            self.tv
+        )
+    }
 }
 
 struct LossParts<B: Backend> {
     total: Tensor<B, 1>,
     pixel: Tensor<B, 1>,
     gradient: Option<Tensor<B, 1>>,
+    flat: Tensor<B, 1>,
+    edge: Tensor<B, 1>,
+    contrast: Tensor<B, 1>,
     stroke: Option<Tensor<B, 1>>,
+    texture: Option<Tensor<B, 1>>,
     feature: Option<Tensor<B, 1>>,
     tv: Option<Tensor<B, 1>>,
 }
@@ -162,9 +340,25 @@ impl<B: Backend> LossParts<B> {
             lr,
             steps_per_s,
             l1: Some(self.pixel.clone().into_scalar().to_f64()),
-            gradient: self.gradient.as_ref().map(|t| t.clone().into_scalar().to_f64()),
-            stroke: self.stroke.as_ref().map(|t| t.clone().into_scalar().to_f64()),
-            feature: self.feature.as_ref().map(|t| t.clone().into_scalar().to_f64()),
+            gradient: self
+                .gradient
+                .as_ref()
+                .map(|t| t.clone().into_scalar().to_f64()),
+            flat: Some(self.flat.clone().into_scalar().to_f64()),
+            edge: Some(self.edge.clone().into_scalar().to_f64()),
+            contrast: Some(self.contrast.clone().into_scalar().to_f64()),
+            stroke: self
+                .stroke
+                .as_ref()
+                .map(|t| t.clone().into_scalar().to_f64()),
+            texture: self
+                .texture
+                .as_ref()
+                .map(|t| t.clone().into_scalar().to_f64()),
+            feature: self
+                .feature
+                .as_ref()
+                .map(|t| t.clone().into_scalar().to_f64()),
             tv: self.tv.as_ref().map(|t| t.clone().into_scalar().to_f64()),
         }
     }
@@ -173,9 +367,25 @@ impl<B: Backend> LossParts<B> {
         ValStepMetrics {
             loss: self.total.clone().into_scalar().to_f64(),
             l1: Some(self.pixel.clone().into_scalar().to_f64()),
-            gradient: self.gradient.as_ref().map(|t| t.clone().into_scalar().to_f64()),
-            stroke: self.stroke.as_ref().map(|t| t.clone().into_scalar().to_f64()),
-            feature: self.feature.as_ref().map(|t| t.clone().into_scalar().to_f64()),
+            gradient: self
+                .gradient
+                .as_ref()
+                .map(|t| t.clone().into_scalar().to_f64()),
+            flat: Some(self.flat.clone().into_scalar().to_f64()),
+            edge: Some(self.edge.clone().into_scalar().to_f64()),
+            contrast: Some(self.contrast.clone().into_scalar().to_f64()),
+            stroke: self
+                .stroke
+                .as_ref()
+                .map(|t| t.clone().into_scalar().to_f64()),
+            texture: self
+                .texture
+                .as_ref()
+                .map(|t| t.clone().into_scalar().to_f64()),
+            feature: self
+                .feature
+                .as_ref()
+                .map(|t| t.clone().into_scalar().to_f64()),
             tv: self.tv.as_ref().map(|t| t.clone().into_scalar().to_f64()),
         }
     }
@@ -199,6 +409,7 @@ fn forward_loss<B: Backend, M: StudentModel<B> + Quantizable<B>>(
     let mut total = pixel.clone().mul_scalar(weights.pixel);
     let mut gradient = None;
     let mut stroke = None;
+    let mut texture = None;
     let mut feature = None;
     let mut tv = None;
 
@@ -235,9 +446,26 @@ fn forward_loss<B: Backend, M: StudentModel<B> + Quantizable<B>>(
         total = total + term.mul_scalar(weights.gradient);
     }
     if weights.stroke > 0.0 {
-        let term = losses::stroke_l1(output.clone(), target);
+        let term = losses::stroke_l1(output.clone(), target.clone());
         stroke = Some(term.clone());
         total = total + term.mul_scalar(weights.stroke);
+    }
+    if weights.texture > 0.0 {
+        let term = losses::texture_energy(output.clone(), target.clone());
+        texture = Some(term.clone());
+        total = total + term.mul_scalar(weights.texture);
+    }
+    let flat = losses::flat(output.clone(), target.clone());
+    if weights.flat > 0.0 {
+        total = total + flat.clone().mul_scalar(weights.flat);
+    }
+    let edge = losses::edge(output.clone(), target.clone());
+    if weights.edge > 0.0 {
+        total = total + edge.clone().mul_scalar(weights.edge);
+    }
+    let contrast = losses::contrast(output.clone(), target.clone());
+    if weights.contrast > 0.0 {
+        total = total + contrast.clone().mul_scalar(weights.contrast);
     }
     if weights.tv > 0.0 {
         let term = losses::total_variation(output);
@@ -249,10 +477,238 @@ fn forward_loss<B: Backend, M: StudentModel<B> + Quantizable<B>>(
         total,
         pixel,
         gradient,
+        flat,
+        edge,
+        contrast,
         stroke,
+        texture,
         feature,
         tv,
     }
+}
+
+struct Slot<M, Opt> {
+    config: Config,
+    /// `None` only while the optimiser step is moving the module.
+    model: Option<M>,
+    optimiser: Opt,
+    schedule: LrSchedule,
+    run_log: RunLog,
+    sample_images: Vec<(String, image::RgbImage)>,
+    last_train_metrics: Option<TrainStepMetrics>,
+    quant_scheme: Option<crate::quant::QuantScheme>,
+    weights: LossWeights,
+}
+
+/// One student inside a cohort. The teacher batch is shared; each slot owns its graph.
+trait CohortSlot {
+    fn train_step(
+        &mut self,
+        content: Tensor<TrainBackend, 4>,
+        target: Tensor<TrainBackend, 4>,
+        teacher_feats: &[Tensor<TrainBackend, 4>],
+        feature_scales: &[f32],
+        cohort: bool,
+        step: usize,
+        iterations: usize,
+        log_this: bool,
+        started: &Instant,
+    ) -> Result<()>;
+
+    fn validate_step(
+        &mut self,
+        content: Tensor<InferBackend, 4>,
+        target: Tensor<InferBackend, 4>,
+        teacher_feats: &[Tensor<InferBackend, 4>],
+        feature_scales: &[f32],
+        cohort: bool,
+        step: usize,
+    ) -> Result<()>;
+
+    fn checkpoint_and_sample(
+        &mut self,
+        step: usize,
+        iterations: usize,
+        checkpoint_every: usize,
+        sample_every: usize,
+        teacher: Option<&dyn DistillTeacher>,
+        device: &TrainDevice,
+    ) -> Result<()>;
+
+    fn finish(&mut self, iterations: usize, wall_s: f64, cohort: bool) -> Result<()>;
+}
+
+impl<M, Opt> CohortSlot for Slot<M, Opt>
+where
+    M: StudentModel<TrainBackend> + Quantizable<TrainBackend> + AutodiffModule<TrainBackend>,
+    M::InnerModule: StudentModel<InferBackend> + Quantizable<InferBackend>,
+    Opt: Optimizer<M, TrainBackend>,
+{
+    fn train_step(
+        &mut self,
+        content: Tensor<TrainBackend, 4>,
+        target: Tensor<TrainBackend, 4>,
+        teacher_feats: &[Tensor<TrainBackend, 4>],
+        feature_scales: &[f32],
+        cohort: bool,
+        step: usize,
+        iterations: usize,
+        log_this: bool,
+        started: &Instant,
+    ) -> Result<()> {
+        let weights = self.weights;
+        let parts = forward_loss(
+            self.model.as_ref().expect("student"),
+            content,
+            target,
+            teacher_feats,
+            feature_scales,
+            &weights,
+            self.quant_scheme.as_ref(),
+        );
+        let grads = GradientsParams::from_grads(
+            parts.total.clone().backward(),
+            self.model.as_ref().expect("student"),
+        );
+        let lr = self.schedule.next();
+        let model = self.model.take().expect("student");
+        self.model = Some(self.optimiser.step(lr, model, grads));
+        if log_this {
+            let elapsed = started.elapsed().as_secs_f64();
+            let metrics = parts.train_metrics(lr, Some(step as f64 / elapsed.max(1e-9)));
+            let prefix = if cohort {
+                format!("[{}] ", self.config.run.name)
+            } else {
+                String::new()
+            };
+            println!(
+                "{prefix}step {step:>7}/{:<7} loss {:>9.5}  l1 {:.5}  grad {:.5}  flat {:.5}  edge {:.5}  contrast {:.5}  stroke {:.5}  tex {:.5}  feat {:.5}  tv {:.5}  lr {:.3e}  {:.2} step/s  {:.1} s",
+                iterations,
+                metrics.loss,
+                metrics.l1.unwrap_or(0.0),
+                metrics.gradient.unwrap_or(0.0),
+                metrics.flat.unwrap_or(0.0),
+                metrics.edge.unwrap_or(0.0),
+                metrics.contrast.unwrap_or(0.0),
+                metrics.stroke.unwrap_or(0.0),
+                metrics.texture.unwrap_or(0.0),
+                metrics.feature.unwrap_or(0.0),
+                metrics.tv.unwrap_or(0.0),
+                metrics.lr,
+                metrics.steps_per_s.unwrap_or(0.0),
+                elapsed,
+            );
+            self.last_train_metrics = Some(metrics.clone());
+            self.run_log.train_step(step, metrics)?;
+        }
+        Ok(())
+    }
+
+    fn validate_step(
+        &mut self,
+        content: Tensor<InferBackend, 4>,
+        target: Tensor<InferBackend, 4>,
+        teacher_feats: &[Tensor<InferBackend, 4>],
+        feature_scales: &[f32],
+        cohort: bool,
+        step: usize,
+    ) -> Result<()> {
+        let weights = self.weights;
+        let valid = self.model.as_ref().expect("student").valid();
+        let val_parts = forward_loss(
+            &valid,
+            content,
+            target,
+            teacher_feats,
+            feature_scales,
+            &weights,
+            self.quant_scheme.as_ref(),
+        );
+        let val_metrics = val_parts.val_metrics();
+        let prefix = if cohort {
+            format!("[{}] ", self.config.run.name)
+        } else {
+            String::new()
+        };
+        println!(
+            "{prefix}  val {step:>7} loss {:>9.5}  l1 {:.5}",
+            val_metrics.loss,
+            val_metrics.l1.unwrap_or(0.0),
+        );
+        self.run_log.val_step(step, val_metrics)?;
+        Ok(())
+    }
+
+    fn checkpoint_and_sample(
+        &mut self,
+        step: usize,
+        iterations: usize,
+        checkpoint_every: usize,
+        sample_every: usize,
+        teacher: Option<&dyn DistillTeacher>,
+        device: &TrainDevice,
+    ) -> Result<()> {
+        if checkpoint_every > 0 && step % checkpoint_every == 0 {
+            save_checkpoint(
+                self.model.as_ref().expect("student"),
+                self.config
+                    .run
+                    .output_dir
+                    .join(format!("step_{step:06}.mpk")),
+            )?;
+        }
+        if sample_every > 0 && (step % sample_every == 0 || step == iterations) {
+            for (name, img) in &self.sample_images {
+                match sample(
+                    self.model.as_ref().expect("student"),
+                    img,
+                    name,
+                    teacher,
+                    &self.config.run.output_dir,
+                    step,
+                    device,
+                    &self.config.run.name,
+                ) {
+                    Ok(metrics) => self.run_log.sample_eval(step, name, metrics)?,
+                    Err(e) => log::warn!("could not write sample '{name}' at step {step}: {e}"),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(&mut self, iterations: usize, wall_s: f64, cohort: bool) -> Result<()> {
+        let final_path = self.config.run.output_dir.join("model.mpk");
+        save_checkpoint(self.model.as_ref().expect("student"), final_path.clone())?;
+        self.run_log
+            .run_end(iterations, wall_s, self.last_train_metrics.clone())?;
+        let prefix = if cohort {
+            format!("[{}] ", self.config.run.name)
+        } else {
+            String::new()
+        };
+        println!("{prefix}done in {wall_s:.1} s -> {}", final_path.display());
+        Ok(())
+    }
+}
+
+fn shared_recipe(config: &Config) -> serde_json::Value {
+    serde_json::json!({
+        "data": config.data,
+        "teacher": config.teacher,
+        "optim": config.optim,
+        "quant": config.quant,
+        "arch": config.student.arch,
+        "device": config.run.device,
+        "log_every": config.run.log_every,
+        "val_every": config.run.val_every,
+        "val_batch_size": config.run.val_batch_size,
+        "checkpoint_every": config.run.checkpoint_every,
+        "sample_every": config.run.sample_every,
+        "sample_limit": config.run.sample_limit,
+        "sample_size": config.run.sample_size,
+        "sample_content": config.run.sample_content,
+    })
 }
 
 /// Run training. `build_student` constructs the concrete model (see [crate::registry]).
@@ -261,21 +717,451 @@ where
     M: StudentModel<TrainBackend> + Quantizable<TrainBackend> + AutodiffModule<TrainBackend>,
     M::InnerModule:
         StudentModel<<TrainBackend as AutodiffBackend>::InnerBackend> + Quantizable<InferBackend>,
-    F: FnOnce(&crate::config::StudentConfig, &TrainDevice) -> Result<M>,
+    F: Fn(&crate::config::StudentConfig, &TrainDevice) -> Result<M>,
 {
-    config.validate()?;
-    let device = select_device(&config.run.device);
+    run_all(vec![config], vec![provenance], build_student)
+}
 
-    let mut run_log = RunLog::open(&config.run.output_dir, &config, &provenance)?;
+/// One teacher forward per step, then a backward pass for each student.
+///
+/// Every config must share the data, teacher, optimiser, and step budget.
+/// Loss weights and `run.seed` may differ. The seed draws that student's
+/// initial weights; crops follow the first config's seed. Each student keeps
+/// its own formula, Adam state, log, and output directory.
+pub fn run_all<M, F>(
+    configs: Vec<Config>,
+    provenances: Vec<RunProvenance>,
+    build_student: F,
+) -> Result<()>
+where
+    M: StudentModel<TrainBackend> + Quantizable<TrainBackend> + AutodiffModule<TrainBackend>,
+    M::InnerModule:
+        StudentModel<<TrainBackend as AutodiffBackend>::InnerBackend> + Quantizable<InferBackend>,
+    F: Fn(&crate::config::StudentConfig, &TrainDevice) -> Result<M>,
+{
+    // Keep CPU preprocessing parallel without saturating the host; this workload uses eight
+    // dedicated Rayon workers regardless of the machine's logical core count.
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(8)
+        .build_global()
+        .map_err(|e| anyhow::anyhow!("cannot configure data preparation thread pool: {e}"))?;
+
+    if configs.is_empty() {
+        bail!("cohort is empty");
+    }
+    if configs.len() != provenances.len() {
+        bail!(
+            "cohort has {} configs and {} provenances",
+            configs.len(),
+            provenances.len()
+        );
+    }
+    let recipe = shared_recipe(&configs[0]);
+    let mut seen_dirs = Vec::new();
+    for config in &configs {
+        config.validate()?;
+        if shared_recipe(config) != recipe {
+            bail!(
+                "cohort member '{}' does not share data, teacher, or step budget with '{}'",
+                config.run.name,
+                configs[0].run.name
+            );
+        }
+        if seen_dirs.contains(&config.run.output_dir) {
+            bail!(
+                "cohort output_dir {} is used more than once",
+                config.run.output_dir.display()
+            );
+        }
+        seen_dirs.push(config.run.output_dir.clone());
+    }
+
+    let config0 = configs[0].clone();
+    let device = select_device(&config0.run.device);
+    let mut rng = StdRng::seed_from_u64(config0.run.seed);
+
+    let dataset = Arc::new(TrainContentSource::build(&config0.data)?);
+    let crop = config0.data.crop as u32;
+    let batch = config0.data.batch_size;
+    let supervision = Supervision::try_from_config(&config0, &device)?;
+
+    let feature_weight = configs
+        .iter()
+        .map(|c| c.loss.feature)
+        .fold(0.0f32, f32::max);
+    if feature_weight > 0.0 {
+        match supervision.teacher() {
+            None => bail!(
+                "loss.feature > 0 requires teacher.enabled = true (feature distillation is teacher-guided)"
+            ),
+            Some(teacher) if !teacher.has_features() => {
+                bail!("loss.feature > 0 requires a MicroAST teacher (teacher.kind = \"microast\")")
+            }
+            Some(_) => {}
+        }
+    }
+    if config0.loss.perceptual > 0.0 || config0.loss.style > 0.0 {
+        log::warn!(
+            "perceptual/style weights are set but the VGG terms are not implemented yet; \
+             they are currently ignored"
+        );
+    }
+    if configs.len() > 1 {
+        let names = configs
+            .iter()
+            .map(|c| c.run.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!(
+            "cohort of {}: one teacher forward per step, then each student backward ({names}); crops use seed {}",
+            configs.len(),
+            config0.run.seed,
+        );
+    }
+
+    let mut slots = Vec::with_capacity(configs.len());
+    for (config, provenance) in configs.into_iter().zip(provenances) {
+        TrainBackend::seed(&device, config.run.seed);
+        let run_log = RunLog::open(&config.run.output_dir, &config, &provenance)?;
+        log::info!("metrics -> {}", run_log.path().display());
+        crate::config::ModelCard::of(&config.student)
+            .with_meta("run", serde_json::Value::String(config.run.name.clone()))
+            .with_meta(
+                "style",
+                serde_json::Value::String(config.teacher.style_label()),
+            )
+            .with_meta(
+                "iterations",
+                serde_json::Value::Number(config.optim.iterations.into()),
+            )
+            .save(&config.run.output_dir)?;
+
+        let mut model: M = build_student(&config.student, &device)?;
+        if let Some(path) = &config.run.init_from {
+            model = load_checkpoint(model, path, &device)?;
+            log::info!("warm start from {}", path.display());
+        }
+        model.after_load();
+        log::info!("student: {}", model.describe());
+
+        let optimiser = AdamConfig::new()
+            .with_beta_1(config.optim.beta_1)
+            .with_beta_2(config.optim.beta_2)
+            .with_epsilon(config.optim.epsilon)
+            .init::<TrainBackend, M>();
+        let schedule = LrSchedule::build(&config.optim)?;
+
+        let prefix = if slots.capacity() > 1 {
+            format!("[{}] ", config.run.name)
+        } else {
+            String::new()
+        };
+        let weights = LossWeights::from_config(&config.loss);
+        println!(
+            "{prefix}training '{}' for {} steps: batch {batch}, crop {crop}, device {}, init seed {}, loss = {}",
+            config.run.name,
+            config.optim.iterations,
+            config.run.device,
+            config.run.seed,
+            weights.formula(),
+        );
+
+        let quant_scheme = if config.quant.enabled {
+            let path = config.quant.calibration.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "quant.enabled = true requires quant.calibration (run the 'calibrate' subcommand first)"
+                )
+            })?;
+            let calibration = crate::quant::Calibration::load(path)?;
+            calibration.validate_for(&model)?;
+            let n_act = model.quant_points().len();
+            println!(
+                "{prefix}low-bit QAT: {} ({} activation points, image scale {:.5}, largest scale {:.4})",
+                calibration.bits.label(),
+                n_act,
+                calibration.scales[0],
+                calibration.scales.iter().cloned().fold(0.0f32, f32::max)
+            );
+            Some(calibration.scheme())
+        } else {
+            None
+        };
+
+        let sample_images = load_sample_images(&config, &dataset)?;
+        slots.push(Slot {
+            config,
+            model: Some(model),
+            optimiser,
+            schedule,
+            run_log,
+            sample_images,
+            last_train_metrics: None,
+            quant_scheme,
+            weights,
+        });
+    }
+    TrainBackend::seed(&device, config0.run.seed);
+    let feature_scales: Vec<f32> = if feature_weight > 0.0 {
+        let teacher = supervision.teacher().expect("checked above");
+        let probe = build_batch(&dataset, crop, batch, &mut rng, &device)?;
+        let probe = probe.content.inner();
+        let (_, feats) = teacher.features(probe)?;
+        let scales: Vec<f32> = feats
+            .iter()
+            .map(|f| (f.clone().abs().mean().into_scalar().to_f64() as f32).max(1e-3))
+            .collect();
+        log::info!("feature distillation scales (per stage): {scales:?}");
+        scales
+    } else {
+        Vec::new()
+    };
+    if feature_weight > 0.0 {
+        println!("feature distillation: weight {feature_weight} over the teacher decoder stages");
+    }
+
+    let cohort = slots.len() > 1;
+    let iterations = slots[0].config.optim.iterations;
+    let log_every = slots[0].config.run.log_every;
+    let val_every = slots[0].config.run.val_every;
+    let checkpoint_every = slots[0].config.run.checkpoint_every;
+    let sample_every = slots[0].config.run.sample_every;
+    let val_batch_size = slots[0].config.run.val_batch_size.max(1);
+    let mut val_rng = StdRng::seed_from_u64(slots[0].config.run.seed ^ VAL_BATCH_SEED);
+    let started = Instant::now();
+    let remember_target = slots[0].config.data.overfit_long_edge.is_some();
+    let mut cached_target: Option<Tensor<InferBackend, 4>> = None;
+
+    // Keep two CPU-prepared batches queued so decoding/cropping for the next step overlaps
+    // teacher and student GPU work. The bounded queue limits host memory usage.
+    let (batch_tx, batch_rx) = mpsc::sync_channel::<Result<CpuBatch>>(2);
+    let producer_dataset = Arc::clone(&dataset);
+    let producer = thread::Builder::new()
+        .name("training-data-prefetch".into())
+        .spawn(move || {
+            let mut train_rng = rng;
+            for _ in 0..iterations {
+                let batch = prepare_cpu_batch(&producer_dataset, crop, batch, &mut train_rng);
+                if batch_tx.send(batch).is_err() {
+                    break;
+                }
+            }
+        })
+        .context("start training data prefetch thread")?;
+
+    let overlap_teacher =
+        supervision.pipelines_on_host() && !remember_target && feature_weight == 0.0;
+    if overlap_teacher {
+        println!("onnx teacher runs one batch ahead of the student backward");
+    }
+    let mut ahead: Option<HostAhead> = None;
+
+    for step in 1..=iterations {
+        let (cpu_batch, host_target) = if let Some(mut pending) = ahead.take() {
+            pending.finish()?;
+            (pending.cpu, pending.ready)
+        } else {
+            (
+                batch_rx
+                    .recv()
+                    .context("training data prefetch thread stopped")??,
+                None,
+            )
+        };
+        let batch_data = upload_batch(cpu_batch, &device);
+        let content = batch_data.content;
+        let (target, teacher_feats) = if let Some(buf) = host_target {
+            let [n, _, h, w] = content.dims();
+            (host_target_tensor(buf, n, h, w, &device)?, Vec::new())
+        } else {
+            resolve_step_target(
+                &supervision,
+                content.clone(),
+                batch_data.target,
+                feature_weight > 0.0,
+                remember_target,
+                &mut cached_target,
+            )?
+        };
+        // Materialise the teacher so its activations drop back into the CUDA
+        // pool as free slices. Do not return those pages to the driver: a new
+        // 487 MiB page does not allocate on this T10, and the student reuses
+        // the slices the teacher already reserved.
+        let _ = target.clone().sum().into_scalar();
+        let log_this = log_every > 0 && (step % log_every == 0 || step == iterations);
+        if overlap_teacher && step < iterations {
+            ahead = Some(launch_host_ahead(&batch_rx, &supervision)?);
+        }
+
+        for slot in &mut slots {
+            let weights = slot.weights;
+            let parts = forward_loss(
+                slot.model.as_ref().expect("student"),
+                content.clone(),
+                target.clone(),
+                &teacher_feats,
+                &feature_scales,
+                &weights,
+                slot.quant_scheme.as_ref(),
+            );
+            let grads = GradientsParams::from_grads(
+                parts.total.clone().backward(),
+                slot.model.as_ref().expect("student"),
+            );
+            let lr = slot.schedule.next();
+            let model = slot.model.take().expect("student");
+            slot.model = Some(slot.optimiser.step(lr, model, grads));
+            if log_this {
+                let elapsed = started.elapsed().as_secs_f64();
+                let metrics = parts.train_metrics(lr, Some(step as f64 / elapsed.max(1e-9)));
+                let prefix = if cohort {
+                    format!("[{}] ", slot.config.run.name)
+                } else {
+                    String::new()
+                };
+                println!(
+                    "{prefix}step {step:>7}/{:<7} loss {:>9.5}  l1 {:.5}  grad {:.5}  flat {:.5}  edge {:.5}  contrast {:.5}  stroke {:.5}  tex {:.5}  feat {:.5}  tv {:.5}  lr {:.3e}  {:.2} step/s  {:.1} s",
+                    iterations,
+                    metrics.loss,
+                    metrics.l1.unwrap_or(0.0),
+                    metrics.gradient.unwrap_or(0.0),
+                    metrics.flat.unwrap_or(0.0),
+                    metrics.edge.unwrap_or(0.0),
+                    metrics.contrast.unwrap_or(0.0),
+                    metrics.stroke.unwrap_or(0.0),
+                    metrics.texture.unwrap_or(0.0),
+                    metrics.feature.unwrap_or(0.0),
+                    metrics.tv.unwrap_or(0.0),
+                    metrics.lr,
+                    metrics.steps_per_s.unwrap_or(0.0),
+                    elapsed,
+                );
+                slot.last_train_metrics = Some(metrics.clone());
+                slot.run_log.train_step(step, metrics)?;
+            }
+        }
+
+        reclaim_teacher(&mut ahead, step, iterations, val_every, sample_every)?;
+        if val_every > 0 && step % val_every == 0 {
+            let val_data = build_batch(&dataset, crop, val_batch_size, &mut val_rng, &device)?;
+            let (val_target, val_teacher_feats) = supervision.resolve_batch(
+                val_data.content.clone(),
+                val_data.target,
+                feature_weight > 0.0,
+            )?;
+            let val_teacher_inner: Vec<Tensor<InferBackend, 4>> = val_teacher_feats
+                .iter()
+                .map(|t| t.clone().inner())
+                .collect();
+            for slot in &mut slots {
+                let weights = slot.weights;
+                let valid = slot.model.as_ref().expect("student").valid();
+                let val_parts = forward_loss(
+                    &valid,
+                    val_data.content.clone().inner(),
+                    val_target.clone().inner(),
+                    &val_teacher_inner,
+                    &feature_scales,
+                    &weights,
+                    slot.quant_scheme.as_ref(),
+                );
+                let val_metrics = val_parts.val_metrics();
+                let prefix = if cohort {
+                    format!("[{}] ", slot.config.run.name)
+                } else {
+                    String::new()
+                };
+                println!(
+                    "{prefix}  val {step:>7} loss {:>9.5}  l1 {:.5}",
+                    val_metrics.loss,
+                    val_metrics.l1.unwrap_or(0.0),
+                );
+                slot.run_log.val_step(step, val_metrics)?;
+            }
+        }
+
+        for slot in &mut slots {
+            if checkpoint_every > 0 && step % checkpoint_every == 0 {
+                save_checkpoint(
+                    slot.model.as_ref().expect("student"),
+                    slot.config
+                        .run
+                        .output_dir
+                        .join(format!("step_{step:06}.mpk")),
+                )?;
+            }
+            // The final step is always sampled, so a 2-step smoke still writes
+            // target_*.png when sample_every is the full-run interval.
+            if sample_every > 0 && (step % sample_every == 0 || step == iterations) {
+                for (name, img) in &slot.sample_images {
+                    match sample(
+                        slot.model.as_ref().expect("student"),
+                        img,
+                        name,
+                        supervision.teacher(),
+                        &slot.config.run.output_dir,
+                        step,
+                        &device,
+                        &slot.config.run.name,
+                    ) {
+                        Ok(metrics) => slot.run_log.sample_eval(step, name, metrics)?,
+                        Err(e) => {
+                            log::warn!("could not write sample '{name}' at step {step}: {e}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    producer
+        .join()
+        .map_err(|_| anyhow::anyhow!("training data prefetch thread panicked"))?;
+
+    let wall_s = started.elapsed().as_secs_f64();
+    for slot in &mut slots {
+        let final_path = slot.config.run.output_dir.join("model.mpk");
+        save_checkpoint(slot.model.as_ref().expect("student"), final_path.clone())?;
+        slot.run_log
+            .run_end(iterations, wall_s, slot.last_train_metrics.clone())?;
+        let prefix = if cohort {
+            format!("[{}] ", slot.config.run.name)
+        } else {
+            String::new()
+        };
+        println!("{prefix}done in {wall_s:.1} s -> {}", final_path.display());
+    }
+    Ok(())
+}
+
+fn recipe_without_arch(config: &Config) -> serde_json::Value {
+    let mut value = shared_recipe(config);
+    value.as_object_mut().expect("recipe object").remove("arch");
+    value
+}
+
+fn boxed_slot<M, F>(
+    config: Config,
+    provenance: RunProvenance,
+    device: &TrainDevice,
+    dataset: &TrainContentSource,
+    cohort: bool,
+    build: F,
+) -> Result<Box<dyn CohortSlot>>
+where
+    M: StudentModel<TrainBackend>
+        + Quantizable<TrainBackend>
+        + AutodiffModule<TrainBackend>
+        + 'static,
+    M::InnerModule: StudentModel<InferBackend> + Quantizable<InferBackend>,
+    F: Fn(&crate::config::StudentConfig, &TrainDevice) -> Result<M>,
+{
+    let run_log = RunLog::open(&config.run.output_dir, &config, &provenance)?;
     log::info!("metrics -> {}", run_log.path().display());
-
-    // Make the run directory self-describing: the inference tool rebuilds the architecture from
-    // this card instead of being handed the training config it came from.
     crate::config::ModelCard::of(&config.student)
         .with_meta("run", serde_json::Value::String(config.run.name.clone()))
         .with_meta(
             "style",
-            serde_json::Value::String(config.teacher.style.display().to_string()),
+            serde_json::Value::String(config.teacher.style_label()),
         )
         .with_meta(
             "iterations",
@@ -283,77 +1169,196 @@ where
         )
         .save(&config.run.output_dir)?;
 
-    let mut rng = StdRng::seed_from_u64(config.run.seed);
-
-    // ---- data ------------------------------------------------------------------------
-    let dataset = PairDataset::build(
-        &config.data.content_dir,
-        config.data.pseudo_gt_dir.as_deref(),
-        config.data.limit,
-    )?;
-    let crop = config.data.crop as u32;
-    let batch = config.data.batch_size;
-
-    let supervision = Supervision::try_from_config(&config, &device)?;
-
-    // ---- model / optimiser -----------------------------------------------------------
-    let mut model: M = build_student(&config.student, &device)?;
+    TrainBackend::seed(device, config.run.seed);
+    let mut model = build(&config.student, device)?;
     if let Some(path) = &config.run.init_from {
-        model = load_checkpoint(model, path, &device)?;
+        model = load_checkpoint(model, path, device)?;
         log::info!("warm start from {}", path.display());
     }
     model.after_load();
     log::info!("student: {}", model.describe());
 
-    let mut optimiser = AdamConfig::new()
+    let optimiser = AdamConfig::new()
         .with_beta_1(config.optim.beta_1)
         .with_beta_2(config.optim.beta_2)
         .with_epsilon(config.optim.epsilon)
         .init::<TrainBackend, M>();
-    let mut schedule = LrSchedule::build(&config.optim)?;
-
-    let loss_weights = LossWeights {
-        pixel: config.loss.pixel,
-        gradient: config.loss.gradient,
-        stroke: config.loss.stroke,
-        feature: config.loss.feature,
-        tv: config.loss.tv,
+    let schedule = LrSchedule::build(&config.optim)?;
+    let prefix = if cohort {
+        format!("[{}] ", config.run.name)
+    } else {
+        String::new()
     };
-    let feature_weight = loss_weights.feature;
-    if feature_weight > 0.0 && supervision.teacher().is_none() {
-        bail!(
-            "loss.feature > 0 requires teacher.enabled = true (feature distillation is teacher-guided)"
-        );
-    }
-    if config.loss.perceptual > 0.0 || config.loss.style > 0.0 {
-        log::warn!(
-            "perceptual/style weights are set but the VGG terms are not implemented yet; \
-             they are currently ignored"
-        );
-    }
-
+    let weights = LossWeights::from_config(&config.loss);
     println!(
-        "training '{}' for {} steps: batch {batch}, crop {crop}, device {}, loss = {}*L1 + {}*gradL1 + {}*stroke + {}*TV",
+        "{prefix}training '{}' for {} steps: batch {}, crop {}, device {}, init seed {}, loss = {}",
         config.run.name,
         config.optim.iterations,
+        config.data.batch_size,
+        config.data.crop,
         config.run.device,
-        loss_weights.pixel,
-        loss_weights.gradient,
-        loss_weights.stroke,
-        loss_weights.tv,
+        config.run.seed,
+        weights.formula(),
     );
-    if feature_weight > 0.0 {
-        println!("feature distillation: weight {feature_weight} over the teacher decoder stages");
+
+    let quant_scheme = if config.quant.enabled {
+        let path = config.quant.calibration.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "quant.enabled = true requires quant.calibration (run the 'calibrate' subcommand first)"
+            )
+        })?;
+        let calibration = crate::quant::Calibration::load(path)?;
+        calibration.validate_for(&model)?;
+        Some(calibration.scheme())
+    } else {
+        None
+    };
+    let sample_images = load_sample_images(&config, dataset)?;
+    Ok(Box::new(Slot {
+        config,
+        model: Some(model),
+        optimiser,
+        schedule,
+        run_log,
+        sample_images,
+        last_train_metrics: None,
+        quant_scheme,
+        weights,
+    }))
+}
+
+fn build_tiny(
+    config: &crate::config::StudentConfig,
+    device: &TrainDevice,
+) -> Result<crate::student::TinyDwStudent<TrainBackend>> {
+    use crate::student::plugin::{parse_kind, parse_site};
+    use crate::student::tiny_dw::{parse_color, parse_encoder, parse_lut_bits};
+    let plugin = parse_kind(config.str_option("plugin", "none")).map_err(anyhow::Error::msg)?;
+    let site = parse_site(config.str_option("plugin_site", "h4")).map_err(anyhow::Error::msg)?;
+    let color = parse_color(config.str_option("color", "none")).map_err(anyhow::Error::msg)?;
+    let encoder = parse_encoder(config.str_option("encoder", "sep")).map_err(anyhow::Error::msg)?;
+    let lut_bits =
+        parse_lut_bits(config.usize_option("lut_bits", 8)).map_err(anyhow::Error::msg)?;
+    let trunk_h8 = crate::student::tiny_dw::parse_trunk_h8(config.str_option("trunk_at", "h4"))
+        .map_err(anyhow::Error::msg)?;
+    Ok(crate::student::TinyDwStudent::with_encoder(
+        config.usize_option("base", 32),
+        config.usize_option("res_blocks", 4),
+        config.usize_option("mid", 32),
+        config.usize_option("fine", 16),
+        plugin,
+        site,
+        color,
+        encoder,
+        config.usize_option("lut_hidden", 4),
+        lut_bits,
+        trunk_h8,
+        device,
+    ))
+}
+
+fn build_guided(
+    config: &crate::config::StudentConfig,
+    device: &TrainDevice,
+) -> Result<crate::student::guided::GuidedStudent<TrainBackend>> {
+    let spec =
+        crate::student::guided::GuideSpec::from_config(config).map_err(anyhow::Error::msg)?;
+    crate::student::guided::print_cost(spec);
+    Ok(crate::student::guided::GuidedStudent::new(spec, device))
+}
+
+/// One teacher forward per step for students whose graphs differ (`tiny_dw` beside
+/// `tiny_dw_guided`). Data, teacher, and step budget still have to match.
+/// Loss weights and `run.seed` may differ. The seed draws that student's
+/// initial weights; crops follow the first config's seed.
+pub fn run_mixed(configs: Vec<Config>, provenances: Vec<RunProvenance>) -> Result<()> {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(8)
+        .build_global()
+        .map_err(|e| anyhow::anyhow!("cannot configure data preparation thread pool: {e}"))?;
+
+    if configs.is_empty() {
+        bail!("cohort is empty");
+    }
+    if configs.len() != provenances.len() {
+        bail!(
+            "cohort has {} configs and {} provenances",
+            configs.len(),
+            provenances.len()
+        );
+    }
+    let recipe = recipe_without_arch(&configs[0]);
+    let mut seen_dirs = Vec::new();
+    for config in &configs {
+        config.validate()?;
+        if recipe_without_arch(config) != recipe {
+            bail!(
+                "cohort member '{}' does not share data, teacher, or step budget with '{}'",
+                config.run.name,
+                configs[0].run.name
+            );
+        }
+        if seen_dirs.contains(&config.run.output_dir) {
+            bail!(
+                "cohort output_dir {} is used more than once",
+                config.run.output_dir.display()
+            );
+        }
+        seen_dirs.push(config.run.output_dir.clone());
     }
 
-    // Feature-distillation normalisation: each stage's L1 is divided by that stage's mean
-    // absolute activation, so the three stages contribute comparably regardless of scale.
-    // Measured once up front, which also keeps the training step free of device syncs.
+    let config0 = configs[0].clone();
+    let device = select_device(&config0.run.device);
+    let mut rng = StdRng::seed_from_u64(config0.run.seed);
+    let dataset = Arc::new(TrainContentSource::build(&config0.data)?);
+    let crop = config0.data.crop as u32;
+    let batch = config0.data.batch_size;
+    let supervision = Supervision::try_from_config(&config0, &device)?;
+    let feature_weight = configs
+        .iter()
+        .map(|c| c.loss.feature)
+        .fold(0.0f32, f32::max);
+    if feature_weight > 0.0 {
+        match supervision.teacher() {
+            None => bail!(
+                "loss.feature > 0 requires teacher.enabled = true (feature distillation is teacher-guided)"
+            ),
+            Some(teacher) if !teacher.has_features() => {
+                bail!("loss.feature > 0 requires a MicroAST teacher (teacher.kind = \"microast\")")
+            }
+            Some(_) => {}
+        }
+    }
+
+    let names = configs
+        .iter()
+        .map(|c| format!("{}:{}", c.run.name, c.student.arch))
+        .collect::<Vec<_>>()
+        .join(", ");
+    println!(
+        "cohort of {}: one teacher forward per step, then each student backward ({names}); crops use seed {}",
+        configs.len(),
+        config0.run.seed,
+    );
+
+    let cohort = configs.len() > 1;
+    let mut slots: Vec<Box<dyn CohortSlot>> = Vec::with_capacity(configs.len());
+    for (config, provenance) in configs.into_iter().zip(provenances) {
+        let slot = match config.student.arch.as_str() {
+            "tiny_dw" => boxed_slot(config, provenance, &device, &dataset, cohort, build_tiny)?,
+            "tiny_dw_guided" => {
+                boxed_slot(config, provenance, &device, &dataset, cohort, build_guided)?
+            }
+            other => bail!("mixed cohort does not support student.arch {other:?}"),
+        };
+        slots.push(slot);
+    }
+    TrainBackend::seed(&device, config0.run.seed);
+
     let feature_scales: Vec<f32> = if feature_weight > 0.0 {
         let teacher = supervision.teacher().expect("checked above");
         let probe = build_batch(&dataset, crop, batch, &mut rng, &device)?;
-        let probe = probe.content.inner();
-        let (_, feats) = teacher.features(probe);
+        let (_, feats) = teacher.features(probe.content.inner())?;
         let scales: Vec<f32> = feats
             .iter()
             .map(|f| (f.clone().abs().mean().into_scalar().to_f64() as f32).max(1e-3))
@@ -364,181 +1369,181 @@ where
         Vec::new()
     };
 
-    // ---- int8 quantisation-aware training ---------------------------------------------
-    // The activation scales are calibrated once, on the fp32 (or already fine-tuned) model,
-    // and then held fixed: the grid the weights must adapt to is the one the accelerator will
-    // actually use.
-    let quant_scheme: Option<crate::quant::QuantScheme> = if config.quant.enabled {
-        let path = config.quant.calibration.as_ref().ok_or_else(|| {
-            anyhow::anyhow!("quant.enabled = true requires quant.calibration (run the 'calibrate' subcommand first)")
-        })?;
-        let calibration = crate::quant::Calibration::load(path)?;
-        calibration.validate_for(&model)?;
-        let n_act = model.quant_points().len();
-        println!(
-            "low-bit QAT: {} ({} activation points, image scale {:.5}, largest scale {:.4})",
-            calibration.bits.label(),
-            n_act,
-            calibration.scales[0],
-            calibration.scales.iter().cloned().fold(0.0f32, f32::max)
-        );
-        Some(calibration.scheme())
-    } else {
-        None
-    };
-
-    // Progress samples: a fixed, held-out image (or folder of images) is much more
-    // informative than the first training image, which is also being fitted.
-    let sample_images: Vec<(String, image::RgbImage)> = {
-        let paths = match &config.run.sample_content {
-            Some(p) => image_paths(p)?,
-            None => vec![dataset.get(0).content.clone()],
-        };
-        let mut out = Vec::new();
-        for path in paths.into_iter().take(3) {
-            let img = load_rgb(&path)?;
-            let img = resize_long_edge(
-                &img,
-                config.run.sample_size as u32,
-                image::imageops::FilterType::Lanczos3,
-            );
-            let name = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("sample")
-                .to_owned();
-            save_rgb(
-                &img,
-                config.run.output_dir.join(format!("content_{name}.png")),
-            )?;
-            out.push((name, img));
-        }
-        out
-    };
-
-    let val_batch_size = config.run.val_batch_size.max(1);
-    let mut val_rng = StdRng::seed_from_u64(config.run.seed ^ VAL_BATCH_SEED);
-
-    // ---- loop ------------------------------------------------------------------------
+    let iterations = config0.optim.iterations;
+    let log_every = config0.run.log_every;
+    let val_every = config0.run.val_every;
+    let checkpoint_every = config0.run.checkpoint_every;
+    let sample_every = config0.run.sample_every;
+    let val_batch_size = config0.run.val_batch_size.max(1);
+    let mut val_rng = StdRng::seed_from_u64(config0.run.seed ^ VAL_BATCH_SEED);
     let started = Instant::now();
-    let mut last_train_metrics: Option<TrainStepMetrics> = None;
+    let remember_target = config0.data.overfit_long_edge.is_some();
+    let mut cached_target: Option<Tensor<InferBackend, 4>> = None;
 
-    for step in 1..=config.optim.iterations {
-        let batch_data = build_batch(&dataset, crop, batch, &mut rng, &device)?;
+    let (batch_tx, batch_rx) = mpsc::sync_channel::<Result<CpuBatch>>(2);
+    let producer_dataset = Arc::clone(&dataset);
+    let producer = thread::Builder::new()
+        .name("training-data-prefetch".into())
+        .spawn(move || {
+            let mut train_rng = rng;
+            for _ in 0..iterations {
+                let batch = prepare_cpu_batch(&producer_dataset, crop, batch, &mut train_rng);
+                if batch_tx.send(batch).is_err() {
+                    break;
+                }
+            }
+        })
+        .context("start training data prefetch thread")?;
+
+    let overlap_teacher =
+        supervision.pipelines_on_host() && !remember_target && feature_weight == 0.0;
+    if overlap_teacher {
+        println!("onnx teacher runs one batch ahead of the student backward");
+    }
+    let mut ahead: Option<HostAhead> = None;
+
+    for step in 1..=iterations {
+        let (cpu_batch, host_target) = if let Some(mut pending) = ahead.take() {
+            pending.finish()?;
+            (pending.cpu, pending.ready)
+        } else {
+            (
+                batch_rx
+                    .recv()
+                    .context("training data prefetch thread stopped")??,
+                None,
+            )
+        };
+        let batch_data = upload_batch(cpu_batch, &device);
         let content = batch_data.content;
-        let (target, teacher_feats) = supervision.resolve_batch(
-            content.clone(),
-            batch_data.target,
-            feature_weight > 0.0,
-        )?;
-
-        let parts = forward_loss(
-            &model,
-            content,
-            target,
-            &teacher_feats,
-            &feature_scales,
-            &loss_weights,
-            quant_scheme.as_ref(),
-        );
-        let loss = parts.total.clone();
-
-        // Avoid per-step `into_scalar` GPU→CPU sync (hurts Gen1/x4 PCIe badly).
-        let log_this = config.run.log_every > 0 && step % config.run.log_every == 0;
-
-        let grads = GradientsParams::from_grads(loss.backward(), &model);
-        let lr = schedule.next();
-        model = optimiser.step(lr, model, grads);
-
-        if log_this {
-            let elapsed = started.elapsed().as_secs_f64();
-            let metrics = parts.train_metrics(lr, Some(step as f64 / elapsed.max(1e-9)));
-            last_train_metrics = Some(metrics.clone());
-            println!(
-                "step {step:>7}/{:<7} loss {:>9.5}  l1 {:.5}  grad {:.5}  stroke {:.5}  feat {:.5}  tv {:.5}  lr {:.3e}  {:.2} step/s  {:.1} s",
-                config.optim.iterations,
-                metrics.loss,
-                metrics.l1.unwrap_or(0.0),
-                metrics.gradient.unwrap_or(0.0),
-                metrics.stroke.unwrap_or(0.0),
-                metrics.feature.unwrap_or(0.0),
-                metrics.tv.unwrap_or(0.0),
-                metrics.lr,
-                metrics.steps_per_s.unwrap_or(0.0),
-                elapsed,
-            );
-            run_log.train_step(step, metrics)?;
+        let (target, teacher_feats) = if let Some(buf) = host_target {
+            let [n, _, h, w] = content.dims();
+            (host_target_tensor(buf, n, h, w, &device)?, Vec::new())
+        } else {
+            resolve_step_target(
+                &supervision,
+                content.clone(),
+                batch_data.target,
+                feature_weight > 0.0,
+                remember_target,
+                &mut cached_target,
+            )?
+        };
+        let _ = target.clone().sum().into_scalar();
+        let log_this = log_every > 0 && (step % log_every == 0 || step == iterations);
+        if overlap_teacher && step < iterations {
+            ahead = Some(launch_host_ahead(&batch_rx, &supervision)?);
         }
 
-        let val_this = config.run.val_every > 0 && step % config.run.val_every == 0;
-        if val_this {
+        for slot in &mut slots {
+            slot.train_step(
+                content.clone(),
+                target.clone(),
+                &teacher_feats,
+                &feature_scales,
+                cohort,
+                step,
+                iterations,
+                log_this,
+                &started,
+            )?;
+        }
+
+        reclaim_teacher(&mut ahead, step, iterations, val_every, sample_every)?;
+        if val_every > 0 && step % val_every == 0 {
             let val_data = build_batch(&dataset, crop, val_batch_size, &mut val_rng, &device)?;
             let (val_target, val_teacher_feats) = supervision.resolve_batch(
                 val_data.content.clone(),
                 val_data.target,
                 feature_weight > 0.0,
             )?;
-            let valid = model.valid();
             let val_teacher_inner: Vec<Tensor<InferBackend, 4>> = val_teacher_feats
                 .iter()
                 .map(|t| t.clone().inner())
                 .collect();
-            let val_parts = forward_loss(
-                &valid,
-                val_data.content.inner(),
-                val_target.inner(),
-                &val_teacher_inner,
-                &feature_scales,
-                &loss_weights,
-                quant_scheme.as_ref(),
-            );
-            let val_metrics = val_parts.val_metrics();
-            println!(
-                "  val {step:>7} loss {:>9.5}  l1 {:.5}",
-                val_metrics.loss,
-                val_metrics.l1.unwrap_or(0.0),
-            );
-            run_log.val_step(step, val_metrics)?;
-        }
-        if config.run.checkpoint_every > 0 && step % config.run.checkpoint_every == 0 {
-            save_checkpoint(
-                &model,
-                config.run.output_dir.join(format!("step_{step:06}.mpk")),
-            )?;
-        }
-        if config.run.sample_every > 0 && step % config.run.sample_every == 0 {
-            for (name, img) in &sample_images {
-                match sample(
-                    &model,
-                    img,
-                    name,
-                    supervision.teacher(),
-                    &config.run.output_dir,
+            for slot in &mut slots {
+                slot.validate_step(
+                    val_data.content.clone().inner(),
+                    val_target.clone().inner(),
+                    &val_teacher_inner,
+                    &feature_scales,
+                    cohort,
                     step,
-                    &device,
-                ) {
-                    Ok(metrics) => run_log.sample_eval(step, name, metrics)?,
-                    Err(e) => {
-                        log::warn!("could not write sample '{name}' at step {step}: {e}");
-                    }
-                }
+                )?;
             }
+        }
+
+        for slot in &mut slots {
+            slot.checkpoint_and_sample(
+                step,
+                iterations,
+                checkpoint_every,
+                sample_every,
+                supervision.teacher(),
+                &device,
+            )?;
         }
     }
 
-    // The canonical name: a run directory plus its model card is a runnable model directory,
-    // so predict/infer/gallery scripts can point straight at runs/<tag>.
-    let final_path = config.run.output_dir.join("model.mpk");
-    save_checkpoint(&model, final_path.clone())?;
+    producer
+        .join()
+        .map_err(|_| anyhow::anyhow!("training data prefetch thread panicked"))?;
     let wall_s = started.elapsed().as_secs_f64();
-    run_log.run_end(config.optim.iterations, wall_s, last_train_metrics)?;
-    println!(
-        "done in {:.1} s -> {}",
-        wall_s,
-        final_path.display()
-    );
+    for slot in &mut slots {
+        slot.finish(iterations, wall_s, cohort)?;
+    }
     Ok(())
 }
+
+fn load_sample_images(
+    config: &Config,
+    dataset: &TrainContentSource,
+) -> Result<Vec<(String, image::RgbImage)>> {
+    let paths = match &config.run.sample_content {
+        Some(p) => image_paths(p)?,
+        None => match dataset.first_content_path() {
+            Some(p) => vec![p],
+            None => bail!("run.sample_content must be set when training from data.hf"),
+        },
+    };
+    let limit = if config.run.sample_limit == 0 {
+        paths.len()
+    } else {
+        config.run.sample_limit
+    };
+    let mut out = Vec::new();
+    for path in paths.into_iter().take(limit) {
+        let img = load_rgb(&path)?;
+        let img = match config.data.overfit_long_edge {
+            Some(edge) => overfit_frame(&img, edge as u32),
+            None => resize_long_edge(
+                &img,
+                config.run.sample_size as u32,
+                image::imageops::FilterType::Lanczos3,
+            ),
+        };
+        let name = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("sample")
+            .to_owned();
+        save_rgb(
+            &img,
+            config.run.output_dir.join(format!("content_{name}.png")),
+        )?;
+        out.push((name, img));
+    }
+    Ok(out)
+}
+
+/// `LOW` when the upsampled paint carries less of the output layout than this.
+/// The two collapsed `whitebox_look` arms scored 0.00; a healthy `b_h4` 0.26–0.47.
+const LOW_PAINT_SPATIAL: f64 = 0.1;
+
+/// `LOW` when any output channel's slope on the teacher is below this.
+/// A healthy `b_h4` bottoms out at 0.67. The `whitebox_look` colour casts sat at 0.14–0.40,
+/// and one of them kept a live paint, so only the slope catches it.
+const LOW_CHANNEL_SLOPE: f64 = 0.5;
 
 /// Run the validation (non-autodiff) model on one image and save the result next to the
 /// teacher's own output, so the log carries an objective quality signal and not just the
@@ -547,10 +1552,11 @@ fn sample<M>(
     model: &M,
     image: &image::RgbImage,
     name: &str,
-    teacher: Option<&Stylizer>,
+    teacher: Option<&dyn DistillTeacher>,
     output_dir: &std::path::Path,
     step: usize,
     device: &TrainDevice,
+    run_name: &str,
 ) -> Result<SampleMetrics>
 where
     M: AutodiffModule<TrainBackend>,
@@ -580,15 +1586,30 @@ where
         saturation,
         psnr_vs_teacher: None,
         lapvar_teacher: None,
+        lapvar_ratio: None,
+        energy_4_8: None,
+        energy_8_16: None,
+        slope_r: None,
+        slope_g: None,
+        slope_b: None,
+        paint_spatial: None,
+        in_dead: None,
     };
     let mut line = format!(
-        "  sample {step:>7} {name:<12} lapvar {:.5}  checker {:.3e}  sat {:.3}",
-        lapvar,
-        checkerboard,
-        saturation,
+        "  [{run_name}] sample {step:>7} {name:<12} lapvar {:.5}  checker {:.3e}  sat {:.3}",
+        lapvar, checkerboard, saturation,
     );
+    if let Some(signal) = valid.sample_signal(content.clone()) {
+        metrics.paint_spatial = Some(signal.paint_spatial as f64);
+        metrics.in_dead = Some(signal.in_dead as f64);
+        line.push_str(&format!(
+            "  paint {:.3}  in_dead {:.2}",
+            signal.paint_spatial, signal.in_dead,
+        ));
+    }
+    let mut low = metrics.paint_spatial.is_some_and(|v| v < LOW_PAINT_SPATIAL);
     if let Some(teacher) = teacher {
-        let mut target = tensor_to_rgb(teacher.stylize(content))?;
+        let mut target = tensor_to_rgb(teacher.stylize(content)?)?;
         if (w, h) != padded.dimensions() {
             target = image::imageops::crop_imm(&target, 0, 0, w, h).to_image();
         }
@@ -598,13 +1619,27 @@ where
         )?;
         let psnr = eval::psnr(&out, &target)?;
         let lapvar_t = eval::lapvar(&target);
+        let lapvar_ratio = lapvar / lapvar_t.max(1e-12);
+        let (energy_4_8, energy_8_16) = eval::energy_ratio(&out, &target);
         metrics.psnr_vs_teacher = Some(psnr);
         metrics.lapvar_teacher = Some(lapvar_t);
+        metrics.lapvar_ratio = Some(lapvar_ratio);
+        metrics.energy_4_8 = Some(energy_4_8);
+        metrics.energy_8_16 = Some(energy_8_16);
+        let slopes = eval::channel_slopes(&out, &target)?;
+        metrics.slope_r = Some(slopes[0]);
+        metrics.slope_g = Some(slopes[1]);
+        metrics.slope_b = Some(slopes[2]);
+        if slopes.iter().any(|s| *s < LOW_CHANNEL_SLOPE) {
+            low = true;
+        }
         line.push_str(&format!(
-            "  psnr_vs_teacher {:>5.2} dB  lapvar_t {:.5}",
-            psnr,
-            lapvar_t,
+            "  psnr {:>5.2} dB  lapvar_ratio {:.2}  e4-8 {:.2}  e8-16 {:.2}  slope {:.2}/{:.2}/{:.2}",
+            psnr, lapvar_ratio, energy_4_8, energy_8_16, slopes[0], slopes[1], slopes[2],
         ));
+    }
+    if low {
+        line.push_str("  LOW");
     }
     println!("{line}");
     Ok(metrics)

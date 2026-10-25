@@ -1,24 +1,21 @@
 #!/usr/bin/env python3
 """Build the visual comparison that ships with the deliverables.
 
-Rows are content images, one sheet per style, columns are: the content, the MicroAST teacher
-it was distilled from, the fp32 student, and each exported variant run by the integer
-reference interpreter. Every quantised tile is labelled with its PSNR against that student
-fp32 render.
-
-The numbers and the pixels come from the same files under runs/<style>/, so the sheet cannot
-drift away from the metrics tables in the notes.
+Rows are content images, one sheet per package name, columns are: the content, the MicroAST
+teacher, the fp32 student, and each exported variant run by the integer reference interpreter.
 """
 
 import json
+import os
 from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
 
 ROOT = Path(__file__).resolve().parent.parent
-RUNS = ROOT / "runs"
-STYLES = ["ink", "vangogh"]
-OUT = ROOT / "deliverables" / "gallery"
+DELIVERABLES = ROOT / "deliverables"
+CACHE = DELIVERABLES / "gallery" / "_cache"
+OUT = DELIVERABLES / "gallery"
+STYLES = os.environ.get("GALLERY_STYLES", "vangogh").split()
 
 TILE = 240
 GAP = 6
@@ -30,6 +27,7 @@ FONT_CANDIDATES = [
     "/usr/share/fonts/dejavu/DejaVuSans.ttf",
     "/usr/share/fonts/liberation/LiberationSans-Regular.ttf",
 ]
+CONTENT = ROOT / "style-transfer" / "demo_inputs"
 
 
 def font(size):
@@ -40,7 +38,6 @@ def font(size):
 
 
 def find(directory, stem):
-    """Match a render by stem; teacher files are named <content>__<style>.png."""
     directory = Path(directory)
     if not directory.is_dir():
         return None
@@ -70,25 +67,27 @@ def load_metrics(path):
 
 
 def columns_for(style):
-    base = RUNS / style
+    base = CACHE / style
     cols = [
-        ("content", ROOT.parent / "style-transfer" / "demo_inputs"),
+        ("content", CONTENT),
         ("MicroAST teacher", base / "teacher"),
-        ("student fp32", base / "eval" / "fp32"),
+        ("student fp32", base / "fp32"),
     ]
     quant_metrics = []
     for bits in ("w8a8", "w4a8"):
-        quant = base / "quant" / bits
-        cols.append(("student " + bits.upper(), quant / "eval" / "int"))
-        quant_metrics.append(load_metrics(quant / "metrics.json"))
+        quant_dir = DELIVERABLES / bits / style
+        if not (quant_dir / "manifest.json").is_file():
+            continue
+        cols.append(("student " + bits.upper(), base / bits))
+        quant_metrics.append(load_metrics(quant_dir / "metrics.json"))
     return cols, quant_metrics
 
 
 def sheet(style):
     cols, quant_metrics = columns_for(style)
-    render_dir = RUNS / style / "eval" / "fp32"
+    render_dir = CACHE / style / "fp32"
     if not render_dir.is_dir():
-        raise SystemExit("no renders under {}; run scripts/evaluate.py first".format(render_dir))
+        raise SystemExit("no renders under {}; run scripts/package.sh first".format(render_dir))
     stems = sorted(p.stem for p in render_dir.glob("*.png"))
 
     width = len(cols) * TILE + (len(cols) + 1) * GAP
@@ -102,7 +101,6 @@ def sheet(style):
         x = GAP + c * (TILE + GAP)
         draw.text((x + 4, 7), name, fill=(235, 235, 240), font=header_font)
 
-    # The last two columns are the quantised exports; their metrics are in the same order.
     metrics_by_column = {}
     for offset, metrics in enumerate(quant_metrics):
         metrics_by_column[len(cols) - len(quant_metrics) + offset] = metrics
@@ -119,10 +117,13 @@ def sheet(style):
             value = metrics.get("per_image", {}).get(path.name, {}).get("fp32_vs_int_db")
             if value is None:
                 continue
-            # A dark plate keeps the number readable over any picture.
             draw.rectangle([x + 3, y + 3, x + 76, y + 23], fill=(0, 0, 0))
-            draw.text((x + 7, y + 5), "{:.1f} dB".format(value), fill=(255, 235, 120),
-                      font=label_font)
+            draw.text(
+                (x + 7, y + 5),
+                "{:.1f} dB".format(value),
+                fill=(255, 235, 120),
+                font=label_font,
+            )
     return out
 
 
@@ -130,11 +131,17 @@ def main():
     OUT.mkdir(parents=True, exist_ok=True)
     made = []
     for style in STYLES:
+        if not (CACHE / style / "fp32").is_dir():
+            print("skip gallery sheet {}: no cache".format(style))
+            continue
         path = OUT / (style + ".png")
         image = sheet(style)
         image.save(path)
         made.append(path)
         print("wrote {} ({}x{})".format(path, image.width, image.height))
+
+    if not made:
+        raise SystemExit("no gallery sheets produced")
 
     images = [Image.open(p) for p in made]
     width = max(i.width for i in images)
@@ -150,16 +157,19 @@ def main():
 
     rows = "".join(
         '<figure><img src="{name}" alt="{name}"><figcaption>{name}</figcaption></figure>'.format(
-            name=p.name) for p in made + [overview])
+            name=p.name
+        )
+        for p in made + [overview]
+    )
     (OUT / "index.html").write_text(
         "<!doctype html>\n<meta charset=utf-8>\n<title>fpga_st_train gallery</title>\n"
         "<style>body{background:#0c0c0e;color:#e8e8ee;font:14px/1.5 system-ui,sans-serif;"
         "margin:24px}figure{margin:0 0 28px}img{max-width:100%;border:1px solid #2a2a30;"
         "display:block}figcaption{color:#9aa;padding-top:6px}</style>\n"
         "<h1>fpga_st_train &mdash; quantisation gallery</h1>\n"
-        "<p>Rows are content images; columns are the content, the MicroAST teacher, the fp32"
-        " student, and the exported variants run by the integer reference. Each labelled tile"
-        " shows its PSNR against that student fp32 render.</p>\n" + rows)
+        "<p>Rows are demo content images. Columns: content, MicroAST teacher, fp32 student,"
+        " W8A8 / W4A8 integer reference. Tile labels are PSNR vs fp32 student.</p>\n" + rows
+    )
     print("wrote", OUT / "index.html")
 
 

@@ -11,7 +11,7 @@ use clap::{Args, Parser, Subcommand};
     about = "FPGA style transfer: MicroAST teacher inference and distillation training"
 )]
 pub struct Cli {
-    /// Compute device: "default", "d0" (discrete GPU 0, the RX 580), "i0", "cpu".
+    /// Compute device. CUDA: "d0" is nvidia-smi index 0 (this machine's V100). Vulkan/wgpu: "d0"/"d1" are discrete adapters, "i0" integrated, "cpu" lavapipe.
     #[arg(long, global = true, default_value = "default")]
     pub device: String,
     #[command(subcommand)]
@@ -83,6 +83,14 @@ pub struct TrainArgs {
     pub iterations: Option<usize>,
     #[arg(long)]
     pub output_dir: Option<PathBuf>,
+    /// Directory with the four MicroAST `*_iter_160000.pth.tar` files. Overrides
+    /// `teacher.weights_dir` from the config (env `TEACHER_WEIGHTS_DIR` also works).
+    #[arg(long)]
+    pub teacher_weights: Option<PathBuf>,
+    /// Another student trained on the same teacher forward. Repeat for a cohort of 2 or 3.
+    /// Data, loss, teacher, seed, and step budget must match `--config`.
+    #[arg(long = "with")]
+    pub with: Vec<PathBuf>,
 }
 
 #[derive(Args, Debug)]

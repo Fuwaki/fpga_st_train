@@ -21,17 +21,33 @@ ROOT = Path(__file__).resolve().parent.parent
 
 
 def parameters(manifest):
-    """Weights plus biases, counted from the layer table."""
+    """Conv weights plus LUT table entry count (informative, not trainable param count)."""
     total = 0
-    for layer in manifest["layers"]:
+    for layer in manifest.get("layers", []):
         kh, kw = layer["kernel"]
         total += layer["out_channels"] * layer["in_channels"] * kh * kw
         total += layer["out_channels"]
+    for lut in manifest.get("lut_layers", []):
+        total += len(lut.get("tables", []))
     return total
 
 
 def collect(runs):
     rows = []
+    runs = Path(runs)
+    if (runs / "w8a8").is_dir() or (runs / "w4a8").is_dir():
+        for bits_dir in sorted(p for p in runs.iterdir() if p.is_dir() and p.name in ("w8a8", "w4a8")):
+            for style_dir in sorted(bits_dir.iterdir()):
+                if not style_dir.is_dir():
+                    continue
+                manifest_path = style_dir / "manifest.json"
+                metrics_path = style_dir / "metrics.json"
+                if not manifest_path.is_file():
+                    continue
+                manifest = json.loads(manifest_path.read_text())
+                metrics = json.loads(metrics_path.read_text()) if metrics_path.is_file() else None
+                rows.append((style_dir.name, bits_dir.name, manifest, metrics))
+        return rows
     for style_dir in sorted(p for p in runs.iterdir() if p.is_dir()):
         quant_root = style_dir / "quant"
         if not quant_root.is_dir():

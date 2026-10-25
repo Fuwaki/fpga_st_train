@@ -5,10 +5,13 @@ edition = "2024"
 description = "FPGA-friendly style transfer: MicroAST teacher inference + distillation training framework"
 
 [features]
-# `wgpu` is WGSL via CubeCL. `vulkan` is the same runtime with CubeCL's SPIR-V
-# compiler (tensor-core kernels on NVIDIA). Build one of them, not both:
+# Default training backend is CUDA (CubeCL on the NVIDIA driver).
+# Vulkan is the AMD / non-CUDA fallback. wgpu is the WGSL path. Build one:
+#   cargo run --release --no-default-features --features cuda
 #   cargo run --release --no-default-features --features vulkan
-default = ["wgpu"]
+#   cargo run --release --no-default-features --features ndarray
+default = ["cuda"]
+cuda = ["burn/cuda"]
 wgpu = ["burn/wgpu"]
 vulkan = ["burn/wgpu", "burn/vulkan"]
 # Pure-CPU fallback / correctness oracle: --no-default-features --features ndarray
@@ -17,6 +20,7 @@ ndarray = ["burn/ndarray"]
 [dependencies]
 # --- deep learning ---
 burn = { version = "0.21.0", features = ["train", "autodiff", "dataset", "std", "store"] }
+burn-autodiff = "0.21.0"
 burn-store = "0.21.0"
 # --- errors / config ---
 anyhow = "1"
@@ -32,3 +36,12 @@ indicatif = "0.17"
 image = "0.25"
 rayon = "1"
 rand = "0.9"
+hf-hub = { version = "0.4", default-features = false, features = ["native-tls", "ureq"] }
+parquet = "55"
+arrow = "55"
+ureq = { version = "2", features = ["json"] }
+# ONNX Runtime for the distillation teachers. WebGPU/Dawn/Vulkan targets the AMD GPU
+# while training stays on CUDA. `ndarray` is how host tensors cross the boundary.
+ort = { version = "2.0.0-rc.15", features = ["webgpu", "ndarray"] }
+ash = "0.38"
+ndarray = "0.17"

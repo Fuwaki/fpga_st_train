@@ -8,12 +8,13 @@ use burn::tensor::backend::AutodiffBackend;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 
+use crate::TrainBackend;
 use crate::backend::TrainDevice;
 use crate::data::dataset::PairDataset;
+use crate::data::train_source::TrainContentSource;
 use crate::quant::{Bits, Calibration, Quantizable};
 use crate::student::StudentModel;
 use crate::train::{build_batch, load_checkpoint};
-use crate::TrainBackend;
 
 /// Inputs for the calibration pass (independent of how the model was trained).
 #[derive(Debug, Clone)]
@@ -54,7 +55,7 @@ where
     F: FnOnce(&TrainDevice) -> Result<M>,
 {
     let mut rng = StdRng::seed_from_u64(job.seed);
-    let dataset = PairDataset::build(&job.content_dir, None, None)?;
+    let dataset = TrainContentSource::Disk(PairDataset::build(&job.content_dir, None, None)?);
 
     let model = load_checkpoint(build_student(device)?, checkpoint, device)?;
     let points = model.quant_points();

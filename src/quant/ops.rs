@@ -365,6 +365,86 @@ pub struct QuantOp {
     pub scale: Option<f32>,
 }
 
+/// One trained LUT-Conv, lowered to a bank of 1-input truth tables.
+///
+/// Training stores a tiny MLP per scalar input. Export enumerates every symmetric
+/// input code, runs that MLP, and quantises the result. Hardware adds the looked-up
+/// codes; it does not store the MLP. Layout of [Self::tables], with `code` in
+/// `[-in_qmax, in_qmax]`:
+///
+/// ```text
+/// index = (input * out_channels + output) * table_len + (code + in_qmax)
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LutLayer {
+    pub name: String,
+    pub in_channels: usize,
+    pub out_channels: usize,
+    pub kernel: [usize; 2],
+    pub stride: [usize; 2],
+    pub reflect_pad: usize,
+    /// `in_channels * kernel_h * kernel_w`: one logical LUT per tap per output channel.
+    pub fan_in: usize,
+    pub in_bits: u8,
+    pub out_bits: u8,
+    pub in_qmax: i32,
+    pub out_qmax: i32,
+    /// Real value of input code `+1`. Codes are symmetric about 0, matching the conv manifest.
+    pub in_scale: f32,
+    /// Real value of one looked-up code. An output channel in real units is `sum(codes) * out_scale`.
+    pub out_scale: f32,
+    /// Scale onto which the integer sum is requantised for the next consumer.
+    /// Chosen so the worst-case sum, `fan_in * out_qmax`, fits in `[-in_qmax, in_qmax]`.
+    pub next_in_scale: f32,
+    /// Reduction across the logical inputs. Always `sum`.
+    pub reduce: String,
+    /// Pointwise map applied to the real-valued sum. `identity` or `leaky_relu`.
+    pub activation: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub leaky_slope: Option<f32>,
+    /// `2 * in_qmax + 1`. Code `-in_qmax` is slot 0.
+    pub table_len: usize,
+    /// Quantised LUT outputs, signed, in the layout above.
+    pub tables: Vec<i16>,
+    /// When true, clamp negative codes to zero after the activation map (decoder ReLU).
+    #[serde(default)]
+    pub post_relu: bool,
+}
+
+impl LutLayer {
+    /// Look up one logical LUT. `input_code` is a symmetric code in `[-in_qmax, in_qmax]`.
+    pub fn code(&self, input: usize, output: usize, input_code: i32) -> i16 {
+        assert!(
+            input < self.fan_in,
+            "lut input {input} outside 0..{}",
+            self.fan_in
+        );
+        assert!(
+            output < self.out_channels,
+            "lut output {output} outside 0..{}",
+            self.out_channels
+        );
+        assert!(
+            (-self.in_qmax..=self.in_qmax).contains(&input_code),
+            "input code {input_code} outside [-{}, {}]",
+            self.in_qmax,
+            self.in_qmax
+        );
+        let slot = (input_code + self.in_qmax) as usize;
+        self.tables[(input * self.out_channels + output) * self.table_len + slot]
+    }
+
+    /// Integer sum of one output channel over a window of input codes.
+    pub fn sum_channel(&self, input_codes: &[i32], output: usize) -> i32 {
+        assert_eq!(input_codes.len(), self.fan_in);
+        input_codes
+            .iter()
+            .enumerate()
+            .map(|(input, code)| i32::from(self.code(input, output, *code)))
+            .sum()
+    }
+}
+
 /// Everything the accelerator needs, alongside `weights.bin`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuantManifest {
@@ -390,6 +470,53 @@ pub struct QuantManifest {
     pub weight_packing: String,
     /// Size of `weights.bin` in bytes.
     pub weight_bytes: usize,
+    /// LUT-Conv truth tables. Empty for a pure conv export, and omitted from that JSON.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lut_layers: Vec<LutLayer>,
+    /// Spatial InstanceNorm + γ, β at a quantised point (in-place on that tensor).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub norm_layers: Vec<InstanceNormLayer>,
+    /// Global-pool FiLM: replaces a same-width 1×1 colour slot in the decoder.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub film_layers: Vec<FilmLayer>,
+}
+
+/// InstanceNorm over H×W, then per-channel γ and β (training surrogate for constant style).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstanceNormLayer {
+    pub name: String,
+    pub point: usize,
+    pub channels: usize,
+    pub in_scale: f32,
+    pub out_scale: f32,
+    pub eps: f32,
+    pub gamma: Vec<f32>,
+    pub beta: Vec<f32>,
+}
+
+/// Quantised 1×1 conv used inside a [FilmLayer] head (GAP vector is 1×1 spatial).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FilmHead {
+    pub in_channels: usize,
+    pub out_channels: usize,
+    pub weight_scale: Vec<f32>,
+    pub weight_codes: Vec<i8>,
+    pub bias_int32: Vec<i32>,
+}
+
+/// `out = x * (gamma(z) + 1) + beta(z)` with `z = GAP(x)` and three 1×1 heads.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FilmLayer {
+    pub name: String,
+    pub channels: usize,
+    pub hidden: usize,
+    pub in_point: usize,
+    pub out_point: usize,
+    pub in_scale: f32,
+    pub out_scale: f32,
+    pub reduce: FilmHead,
+    pub gamma: FilmHead,
+    pub beta: FilmHead,
 }
 
 /// Pack weight codes into bytes.

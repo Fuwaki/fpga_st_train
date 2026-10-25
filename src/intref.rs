@@ -2,9 +2,10 @@
 //!
 //! This is the reference implementation of what manifest.json plus weights.bin describe:
 //! integer convolutions with an int32 accumulator, per-output-channel requantisation, and the
-//! unsigned uint8 image at the end. It contains no floating point arithmetic other than the
-//! final per-channel requantisation multiply, which is exactly what a fixed-point datapath
-//! does with a fractional multiplier.
+//! unsigned uint8 image at the end. A LUT-Conv is the same idea with the product replaced by
+//! a truth-table lookup: each window tap is a code, the table returns a code, and the channel
+//! is the integer sum. The only floating-point step in either path is the requantisation
+//! multiply, which is the fractional scale a fixed-point datapath applies.
 //!
 //! Two things use it:
 //!
@@ -21,7 +22,32 @@ use anyhow::{Context, Result, bail};
 use image::RgbImage;
 use rayon::prelude::*;
 
-use crate::quant::{QuantLayer, QuantManifest};
+use crate::quant::{FilmHead, FilmLayer, InstanceNormLayer, LutLayer, QuantLayer, QuantManifest};
+
+/// Last integer activation produced by a LUT graph.
+#[derive(Clone, Debug)]
+pub struct IntCodes {
+    pub channels: usize,
+    pub height: usize,
+    pub width: usize,
+    pub codes: Vec<i32>,
+    /// Real value of code `+1`.
+    pub scale: f32,
+}
+
+impl IntCodes {
+    fn dequant(&self) -> Vec<f32> {
+        self.codes
+            .iter()
+            .map(|code| *code as f32 * self.scale)
+            .collect()
+    }
+}
+
+enum RunOut {
+    Image(Vec<f32>),
+    Features(IntCodes),
+}
 
 /// One activation tensor as integer codes, laid out [C][H][W].
 #[derive(Clone, Debug)]
@@ -58,6 +84,24 @@ impl IntModel {
             );
         }
         let weights = manifest.load_weights(&dir)?;
+        for layer in &manifest.lut_layers {
+            let expect = layer.fan_in * layer.out_channels * layer.table_len;
+            if layer.tables.len() != expect {
+                bail!(
+                    "{} has {} table entries, expected {expect}",
+                    layer.name,
+                    layer.tables.len()
+                );
+            }
+            let taps = layer.in_channels * layer.kernel[0] * layer.kernel[1];
+            if layer.fan_in != taps {
+                bail!(
+                    "{} fan_in is {}, kernel covers {taps} taps",
+                    layer.name,
+                    layer.fan_in
+                );
+            }
+        }
         Ok(Self {
             manifest,
             weights,
@@ -68,26 +112,62 @@ impl IntModel {
     /// One-line description for logs.
     pub fn describe(&self) -> String {
         let m = &self.manifest;
-        format!(
-            "{} {} ({} layers, {} weight codes = {} KiB as {})",
-            m.arch,
-            m.bits.label(),
-            m.layers.len(),
-            self.weights.len(),
-            m.weight_bytes as f32 / 1024.0,
-            m.weight_packing,
-        )
+        if m.lut_layers.is_empty() {
+            format!(
+                "{} {} ({} layers, {} weight codes = {} KiB as {})",
+                m.arch,
+                m.bits.label(),
+                m.layers.len(),
+                self.weights.len(),
+                m.weight_bytes as f32 / 1024.0,
+                m.weight_packing,
+            )
+        } else {
+            let entries: usize = m.lut_layers.iter().map(|layer| layer.tables.len()).sum();
+            format!(
+                "{} {} ({} lut layers, {entries} truth-table entries)",
+                m.arch,
+                m.bits.label(),
+                m.lut_layers.len(),
+            )
+        }
     }
 
     /// Run the exported graph on one RGB image.
     pub fn forward_image(&self, img: &RgbImage) -> Result<RgbImage> {
         let (data, h, w) = rgb_to_chw(img);
         let out = self.forward_chw(&data, h, w)?;
+        if out.len() != 3 * h * w {
+            bail!(
+                "this export does not produce a {}x{} RGB image ({} values)",
+                w,
+                h,
+                out.len()
+            );
+        }
         Ok(chw_to_rgb(&out, h, w))
     }
 
     /// Run the exported graph on a [3][H][W] f32 image in [0, 1].
+    ///
+    /// A conv export returns the RGB image. A LUT export returns the last feature map,
+    /// dequantised with that point's scale.
     pub fn forward_chw(&self, input: &[f32], height: usize, width: usize) -> Result<Vec<f32>> {
+        Ok(match self.run(input, height, width)? {
+            RunOut::Image(values) => values,
+            RunOut::Features(codes) => codes.dequant(),
+        })
+    }
+
+    /// Integer codes of the last LUT activation. Conv exports end on an image instead.
+    pub fn forward_codes(&self, input: &[f32], height: usize, width: usize) -> Result<IntCodes> {
+        match self.run(input, height, width)? {
+            RunOut::Features(codes) => Ok(codes),
+            RunOut::Image(_) => bail!("this export ends on an RGB image; use forward_chw"),
+        }
+    }
+
+    fn run(&self, input: &[f32], height: usize, width: usize) -> Result<RunOut> {
         let m = &self.manifest;
         if input.len() != 3 * height * width {
             bail!(
@@ -98,6 +178,21 @@ impl IntModel {
         }
         let by_name: HashMap<&str, &QuantLayer> =
             m.layers.iter().map(|l| (l.name.as_str(), l)).collect();
+        let lut_by_name: HashMap<&str, &LutLayer> = m
+            .lut_layers
+            .iter()
+            .map(|layer| (layer.name.as_str(), layer))
+            .collect();
+        let norm_by_name: HashMap<&str, &InstanceNormLayer> = m
+            .norm_layers
+            .iter()
+            .map(|layer| (layer.name.as_str(), layer))
+            .collect();
+        let film_by_name: HashMap<&str, &FilmLayer> = m
+            .film_layers
+            .iter()
+            .map(|layer| (layer.name.as_str(), layer))
+            .collect();
 
         let point_count = m.points.len();
         let mut points: Vec<Option<Act>> = (0..point_count).map(|_| None).collect();
@@ -194,16 +289,110 @@ impl IntModel {
                         .with_context(|| format!("graph[{index}]: point {point} is not live"))?;
                     points[point] = Some(upsample2x(src));
                 }
+                "lut_conv2d" => {
+                    let name = op
+                        .layer
+                        .as_deref()
+                        .with_context(|| format!("graph[{index}]: lut_conv2d without a layer"))?;
+                    let layer = lut_by_name
+                        .get(name)
+                        .with_context(|| format!("graph[{index}]: unknown lut layer {name}"))?;
+                    let source = op.source_point.with_context(|| {
+                        format!("graph[{index}]: lut_conv2d without a source_point")
+                    })?;
+                    let dest = op
+                        .point
+                        .with_context(|| format!("graph[{index}]: lut_conv2d without a point"))?;
+                    let src = points
+                        .get(source)
+                        .and_then(|p| p.as_ref())
+                        .with_context(|| {
+                            format!("graph[{index}]: point {source} is not live for {name}")
+                        })?;
+                    let src_scale = op.scale.unwrap_or(m.point_scales[source]);
+                    let out = lut_conv(layer, src, src_scale)?;
+                    if dest >= point_count {
+                        bail!("graph[{index}]: {name} writes point {dest} out of range");
+                    }
+                    points[dest] = Some(out);
+                }
                 "quantize_u8_output" => {
                     let codes = image.take().with_context(|| {
                         format!("graph[{index}]: no image produced before the output op")
                     })?;
                     let scale = op.scale.unwrap_or(1.0 / 255.0);
                     let out: Vec<f32> = codes.data.iter().map(|c| *c as f32 * scale).collect();
-                    return Ok(out);
+                    return Ok(RunOut::Image(out));
+                }
+                "instance_norm" => {
+                    let name = op.layer.as_deref().with_context(|| {
+                        format!("graph[{index}]: instance_norm without a layer")
+                    })?;
+                    let spec = norm_by_name
+                        .get(name)
+                        .with_context(|| format!("graph[{index}]: unknown norm layer {name}"))?;
+                    let point = op.point.with_context(|| {
+                        format!("graph[{index}]: instance_norm without a point")
+                    })?;
+                    let src = points
+                        .get(point)
+                        .and_then(|p| p.as_ref())
+                        .with_context(|| format!("graph[{index}]: point {point} is not live"))?;
+                    points[point] = Some(instance_norm(spec, src, m.act_qmax)?);
+                }
+                "film" => {
+                    let name = op
+                        .layer
+                        .as_deref()
+                        .with_context(|| format!("graph[{index}]: film without a layer"))?;
+                    let spec = film_by_name
+                        .get(name)
+                        .with_context(|| format!("graph[{index}]: unknown film layer {name}"))?;
+                    let src = points
+                        .get(spec.in_point)
+                        .and_then(|p| p.as_ref())
+                        .with_context(|| {
+                            format!(
+                                "graph[{index}]: point {} is not live for {name}",
+                                spec.in_point
+                            )
+                        })?;
+                    let out = film_forward(spec, src, m.act_qmax)?;
+                    points[spec.out_point] = Some(out);
+                }
+                "relu_point" => {
+                    let point = op
+                        .point
+                        .with_context(|| format!("graph[{index}]: relu_point without a point"))?;
+                    let src = points
+                        .get(point)
+                        .and_then(|p| p.as_ref())
+                        .with_context(|| format!("graph[{index}]: point {point} is not live"))?;
+                    let qmax = m.act_qmax;
+                    let mut data = src.data.clone();
+                    for code in &mut data {
+                        *code = round_clamp(*code as f32, 0.0, qmax);
+                    }
+                    points[point] = Some(Act {
+                        c: src.c,
+                        h: src.h,
+                        w: src.w,
+                        data,
+                    });
                 }
                 other => bail!("graph[{index}]: unknown op {other}"),
             }
+        }
+        if !m.lut_layers.is_empty() {
+            let (act, scale) =
+                last_live(&points, &m.point_scales).context("lut graph produced no activation")?;
+            return Ok(RunOut::Features(IntCodes {
+                channels: act.c,
+                height: act.h,
+                width: act.w,
+                codes: act.data.clone(),
+                scale,
+            }));
         }
         bail!("the graph never reached a quantize_u8_output step")
     }
@@ -280,6 +469,198 @@ impl IntModel {
             data: out,
         }
     }
+}
+
+/// One LUT-Conv: reflect pad, truth-table lookup, integer sum, leaky map, requant.
+///
+/// Tap order matches export. For kernel offsets `(ky, kx)` and input channel `ic` the logical
+/// input is `(ky * kw + kx) * in_channels + ic`.
+fn lut_conv(layer: &LutLayer, input: &Act, source_scale: f32) -> Result<Act> {
+    if layer.reduce != "sum" {
+        bail!(
+            "{} reduces by {}, only sum is implemented",
+            layer.name,
+            layer.reduce
+        );
+    }
+    if input.c != layer.in_channels {
+        bail!(
+            "{} expects {} channels, got {}",
+            layer.name,
+            layer.in_channels,
+            input.c
+        );
+    }
+    let negative = match layer.activation.as_str() {
+        "identity" => 1.0,
+        "leaky_relu" => layer
+            .leaky_slope
+            .with_context(|| format!("{} leaky_relu has no slope", layer.name))?,
+        other => bail!("{} has unknown activation {other}", layer.name),
+    };
+    let (kh, kw) = (layer.kernel[0], layer.kernel[1]);
+    let (sh, sw) = (layer.stride[0], layer.stride[1]);
+    let padded = reflect_pad(input, layer.reflect_pad);
+    if padded.h < kh || padded.w < kw {
+        bail!(
+            "{} input {}x{} is smaller than the kernel",
+            layer.name,
+            padded.h,
+            padded.w
+        );
+    }
+    let out_h = (padded.h - kh) / sh + 1;
+    let out_w = (padded.w - kw) / sw + 1;
+    let qmax = layer.in_qmax as f32;
+    let mut data = vec![0i32; layer.out_channels * out_h * out_w];
+    for oc in 0..layer.out_channels {
+        for oy in 0..out_h {
+            for ox in 0..out_w {
+                let mut acc = 0i32;
+                let mut fan = 0usize;
+                for ky in 0..kh {
+                    for kx in 0..kw {
+                        let y = oy * sh + ky;
+                        let x = ox * sw + kx;
+                        for ic in 0..layer.in_channels {
+                            let raw = padded.data[(ic * padded.h + y) * padded.w + x];
+                            let real = raw as f32 * source_scale;
+                            let code = round_clamp(
+                                real / layer.in_scale,
+                                -layer.in_qmax as f32,
+                                layer.in_qmax as f32,
+                            );
+                            acc += i32::from(layer.code(fan, oc, code as i32));
+                            fan += 1;
+                        }
+                    }
+                }
+                let mut real = acc as f32 * layer.out_scale;
+                if acc < 0 {
+                    real *= negative;
+                }
+                let mut code = round_clamp(real / layer.next_in_scale, -qmax, qmax);
+                if layer.post_relu {
+                    code = round_clamp(code as f32, 0.0, qmax);
+                }
+                data[(oc * out_h + oy) * out_w + ox] = code;
+            }
+        }
+    }
+    Ok(Act {
+        c: layer.out_channels,
+        h: out_h,
+        w: out_w,
+        data,
+    })
+}
+
+fn instance_norm(spec: &InstanceNormLayer, input: &Act, qmax: f32) -> Result<Act> {
+    if input.c != spec.channels {
+        bail!(
+            "{} expects {} channels, got {}",
+            spec.name,
+            spec.channels,
+            input.c
+        );
+    }
+    let scale = spec.in_scale;
+    let out_scale = spec.out_scale;
+    let plane = input.h * input.w;
+    let mut out = vec![0i32; input.data.len()];
+    for c in 0..spec.channels {
+        let base = c * plane;
+        let mut sum = 0.0f32;
+        for i in 0..plane {
+            sum += input.data[base + i] as f32 * scale;
+        }
+        let mean = sum / plane as f32;
+        let mut var = 0.0f32;
+        for i in 0..plane {
+            let x = input.data[base + i] as f32 * scale - mean;
+            var += x * x;
+        }
+        var /= plane as f32;
+        let inv = 1.0 / (var + spec.eps).sqrt();
+        let gamma = spec.gamma[c];
+        let beta = spec.beta[c];
+        for i in 0..plane {
+            let x = input.data[base + i] as f32 * scale;
+            let y = gamma * (x - mean) * inv + beta;
+            out[base + i] = round_clamp(y / out_scale, -qmax, qmax);
+        }
+    }
+    Ok(Act {
+        c: input.c,
+        h: input.h,
+        w: input.w,
+        data: out,
+    })
+}
+
+fn film_matvec(head: &FilmHead, in_scale: f32, input: &[f32]) -> Vec<f32> {
+    let mut out = vec![0.0f32; head.out_channels];
+    for oc in 0..head.out_channels {
+        let ws = head.weight_scale[oc];
+        let mut acc = head.bias_int32[oc] as f32 * ws * in_scale;
+        let w_base = oc * head.in_channels;
+        for ic in 0..head.in_channels {
+            let w = head.weight_codes[w_base + ic] as f32 * ws;
+            acc += w * input[ic];
+        }
+        out[oc] = acc;
+    }
+    out
+}
+
+fn film_forward(spec: &FilmLayer, input: &Act, qmax: f32) -> Result<Act> {
+    if input.c != spec.channels {
+        bail!(
+            "{} expects {} channels, got {}",
+            spec.name,
+            spec.channels,
+            input.c
+        );
+    }
+    let plane = input.h * input.w;
+    let mut gap = vec![0.0f32; spec.channels];
+    for c in 0..spec.channels {
+        let base = c * plane;
+        let mut sum = 0.0f32;
+        for i in 0..plane {
+            sum += input.data[base + i] as f32 * spec.in_scale;
+        }
+        gap[c] = sum / plane as f32;
+    }
+    let z = film_matvec(&spec.reduce, spec.in_scale, &gap);
+    let z = z.into_iter().map(|v| v.max(0.0)).collect::<Vec<_>>();
+    let gamma = film_matvec(&spec.gamma, spec.in_scale, &z);
+    let beta = film_matvec(&spec.beta, spec.in_scale, &z);
+    let mut out = vec![0i32; input.data.len()];
+    for c in 0..spec.channels {
+        let g = gamma[c] + 1.0;
+        let b = beta[c];
+        let base = c * plane;
+        for i in 0..plane {
+            let x = input.data[base + i] as f32 * spec.in_scale;
+            let y = x * g + b;
+            out[base + i] = round_clamp(y / spec.out_scale, -qmax, qmax);
+        }
+    }
+    Ok(Act {
+        c: input.c,
+        h: input.h,
+        w: input.w,
+        data: out,
+    })
+}
+
+fn last_live<'a>(points: &'a [Option<Act>], scales: &[f32]) -> Option<(&'a Act, f32)> {
+    points
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(index, point)| point.as_ref().map(|act| (act, scales[index])))
 }
 
 /// Round half away from zero and clamp, matching the backends round() and the requant clamp.

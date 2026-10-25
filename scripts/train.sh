@@ -9,6 +9,8 @@
 # to runs/<tag>/, and the complete stdout is kept in runs/log/<tag>.log.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+# shellcheck disable=SC1091
+source scripts/cuda_env.sh
 
 tag="${1:?usage: scripts/train.sh <tag> [device]}"
 device="${2:-d0}"
@@ -19,5 +21,5 @@ if [ ! -f "$config" ]; then
 fi
 
 mkdir -p runs/log "runs/${tag}"
-echo "training ${tag} from ${config} on ${device} (vulkan, log: runs/log/${tag}.log)"
-cargo run --release --no-default-features --features vulkan -- --device "${device}" train --config "${config}" 2>&1 | tee "runs/log/${tag}.log"
+echo "training ${tag} from ${config} on ${device} (cuda, log: runs/log/${tag}.log)"
+cargo run --release --no-default-features --features cuda -- --device "${device}" train --config "${config}" 2>&1 | tee "runs/log/${tag}.log"

@@ -19,16 +19,41 @@
 //!   at 1/4 resolution, *before* any upsampling; this student does the same by having none.
 //! - Reflection padding (not zero padding) everywhere, matching the teacher.
 
-use burn::module::Module;
+use burn::module::{Initializer, Module};
 use burn::nn::PaddingConfig2d;
 use burn::nn::conv::{Conv2d, Conv2dConfig};
 use burn::prelude::*;
 use burn::tensor::activation::relu;
-use burn::tensor::module::{conv2d, interpolate};
-use burn::tensor::ops::{InterpolateMode, InterpolateOptions, PadMode, PaddedConvOptions};
+use burn::tensor::module::interpolate;
+use burn::tensor::ops::{InterpolateMode, InterpolateOptions, PadMode};
+
+use super::conv::conv2d_valid;
 
 use crate::quant;
 use crate::student::StudentModel;
+
+/// Weight init for one convolution.
+///
+/// `Default` is Burn's `Conv2dConfig` init: `KaimingUniform { gain: 1/√3 }`,
+/// variance `1/(3·fan_in)`. `Relu` is `KaimingUniform { gain: √2 }`, variance
+/// `2/fan_in`, which keeps a ReLU network's signal at O(1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConvInit {
+    Default,
+    Relu,
+}
+
+impl ConvInit {
+    pub(crate) fn apply(self, config: Conv2dConfig) -> Conv2dConfig {
+        match self {
+            ConvInit::Default => config,
+            ConvInit::Relu => config.with_initializer(Initializer::KaimingUniform {
+                gain: 2.0f64.sqrt(),
+                fan_out_only: false,
+            }),
+        }
+    }
+}
 
 /// ReflectionPad(k/2) + Conv2d. The same trick the teacher uses, because Burn has no
 /// reflect-padded convolution primitive.
@@ -47,10 +72,33 @@ impl<B: Backend> Conv<B> {
         bias: bool,
         device: &B::Device,
     ) -> Self {
-        let conv = Conv2dConfig::new([in_ch, out_ch], [kernel, kernel])
-            .with_stride([stride, stride])
-            .with_padding(PaddingConfig2d::Valid)
-            .with_bias(bias)
+        Self::with_init(
+            in_ch,
+            out_ch,
+            kernel,
+            stride,
+            bias,
+            ConvInit::Default,
+            device,
+        )
+    }
+
+    pub fn with_init(
+        in_ch: usize,
+        out_ch: usize,
+        kernel: usize,
+        stride: usize,
+        bias: bool,
+        init: ConvInit,
+        device: &B::Device,
+    ) -> Self {
+        let conv = init
+            .apply(
+                Conv2dConfig::new([in_ch, out_ch], [kernel, kernel])
+                    .with_stride([stride, stride])
+                    .with_padding(PaddingConfig2d::Valid)
+                    .with_bias(bias),
+            )
             .init(device);
         Self {
             conv,
@@ -86,17 +134,13 @@ impl<B: Backend> Conv<B> {
             x
         };
         let bias = self.conv.bias.as_ref().map(|b| b.val());
-        conv2d(
+        conv2d_valid(
             x,
             weight,
             bias,
-            PaddedConvOptions::asymmetric(
-                self.conv.stride,
-                [0, 0],
-                [0, 0],
-                self.conv.dilation,
-                self.conv.groups,
-            ),
+            self.conv.stride,
+            self.conv.dilation,
+            self.conv.groups,
         )
     }
 }

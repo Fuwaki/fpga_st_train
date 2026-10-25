@@ -1,8 +1,8 @@
 //! Measure host↔device bounce cost on the selected adapter.
-use std::time::Instant;
 use burn::prelude::*;
 use burn::tensor::Distribution;
 use fpga_st_train::backend::{InferBackend, select_device};
+use std::time::Instant;
 
 fn sync(t: &Tensor<InferBackend, 4>) {
     let _ = t.clone().mean().into_scalar();

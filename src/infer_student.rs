@@ -5,9 +5,9 @@
 
 use burn::prelude::*;
 
+use crate::InferBackend;
 use crate::quant::{QuantScheme, Quantizable};
 use crate::student::StudentModel;
-use crate::InferBackend;
 
 /// Runtime student used by [crate::deploy::Engine] (fp32 and sim modes).
 pub trait InferStudent {
