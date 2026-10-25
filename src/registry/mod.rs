@@ -131,6 +131,7 @@ pub fn load_student_fp32(
     (lookup(&card.arch)?.load_fp32)(card, checkpoint, device)
 }
 
+pub use guided::build as build_guided;
 /// Re-export builders for tests and one-off scripts.
 pub use tiny::build as build_tiny;
 pub use tiny_dw::build as build_tiny_dw;

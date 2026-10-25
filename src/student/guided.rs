@@ -620,37 +620,73 @@ impl<B: Backend> GuidedStudent<B> {
         mean_paint: bool,
         probe_dead: bool,
     ) -> (Tensor<B, 4>, Option<f32>) {
+        let ablate = if mean_paint {
+            Ablate::MeanPaint
+        } else {
+            Ablate::None
+        };
+        self.render_tapped(content, ablate, probe_dead, &mut |_, _| {})
+    }
+
+    /// Every stage of the forward, in order, for probes. `tap` sees each map
+    /// once; the output is the same tensor [`Self::forward`] returns.
+    pub fn trace(
+        &self,
+        content: Tensor<B, 4>,
+        ablate: Ablate,
+        tap: &mut dyn FnMut(&'static str, &Tensor<B, 4>),
+    ) -> Tensor<B, 4> {
+        self.render_tapped(content, ablate, false, tap).0
+    }
+
+    fn render_tapped(
+        &self,
+        content: Tensor<B, 4>,
+        ablate: Ablate,
+        probe_dead: bool,
+        tap: &mut dyn FnMut(&'static str, &Tensor<B, 4>),
+    ) -> (Tensor<B, 4>, Option<f32>) {
         let [_, _, h0, w0] = content.dims();
         let x = pad_spatial(content, 8);
         let low = avg_pool2d(x.clone(), [2, 2], [2, 2], [0, 0], true, false);
         let low_for_guide = self.h2_guide.is_some().then(|| low.clone());
         let mut f = relu(self.stem.forward(low));
+        tap("stem", &f);
         f = self.enc0.forward(f);
+        tap("enc0", &f);
         f = self.enc1.forward(f);
-        for block in &self.res {
+        tap("enc1", &f);
+        for (index, block) in self.res.iter().enumerate() {
             f = block.forward(f);
+            tap(RES_TAPS.get(index).copied().unwrap_or("res"), &f);
         }
         let in_dead = probe_dead.then(|| channel_dead_frac(f.clone()));
         f = self.trunk_norm.forward(f);
+        tap("trunk_norm", &f);
         f = if self.spec.trunk_h4 {
             self.dec_h4.forward(f)
         } else {
             self.dec_h4.forward(self.up2(f, &self.shuffle_h8))
         };
+        tap("dec_h4", &f);
         f = self.dec_h2.forward(self.up2(f, &self.shuffle_h4));
+        tap("dec_h2", &f);
         if let Some(conv) = &self.h2_guide {
             let mut edge = relu(conv.forward(low_for_guide.expect("pooled rgb")));
             if let Some(proj) = &self.h2_guide_proj {
                 edge = proj.forward(edge);
             }
+            tap("h2_guide", &edge);
             f = f + edge;
         }
         if let Some(film) = &self.film_h2 {
             f = film.forward(f);
+            tap("film_h2", &f);
         }
         // Project at H/2, then spread the 8-channel paint. The guide is what
         // breaks the 2×2 blocks back onto the original edges.
         f = relu(self.to_guide.forward(f));
+        tap("paint", &f);
         f = self.up2(f, &self.shuffle_guide);
         let guide = self.guide.forward(x);
         let guide = if self.spec.guide_relu {
@@ -658,10 +694,16 @@ impl<B: Backend> GuidedStudent<B> {
         } else {
             guide
         };
-        let paint = if mean_paint {
+        tap("guide", &guide);
+        let paint = if ablate == Ablate::MeanPaint {
             f.mean_dim(2).mean_dim(3)
         } else {
             f
+        };
+        let guide = if ablate == Ablate::MeanGuide {
+            guide.mean_dim(2).mean_dim(3)
+        } else {
+            guide
         };
         let mut f = if let Some(gain) = &self.guide_gain {
             let g = gain.forward(paint.clone());
@@ -674,8 +716,10 @@ impl<B: Backend> GuidedStudent<B> {
         if let Some(film) = &self.film_guide {
             f = film.forward(f);
         }
+        tap("mix", &f);
         let y = if let Some(full) = &self.full_sep {
             let mut f = full.forward(f);
+            tap("full", &f);
             if let Some(film) = &self.film_full {
                 f = film.forward(f);
             }
@@ -689,7 +733,9 @@ impl<B: Backend> GuidedStudent<B> {
                 .expect("full-res head")
                 .forward_inner(f, false)
         };
-        (crop_spatial(y, h0, w0), in_dead)
+        let y = crop_spatial(y, h0, w0);
+        tap("rgb", &y);
+        (y, in_dead)
     }
 
     fn up2(&self, x: Tensor<B, 4>, shuffle: &Option<Plugin<B>>) -> Tensor<B, 4> {
@@ -764,6 +810,18 @@ impl<B: Backend> quant::Quantizable<B> for GuidedStudent<B> {
 
     fn observe_activations(&self, _content: Tensor<B, 4>, _observe: &mut dyn FnMut(usize, f32)) {}
 }
+
+/// Which path [`GuidedStudent::trace`] replaces with its per-channel spatial mean.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ablate {
+    None,
+    /// The upsampled paint, just before the full-resolution guide is added.
+    MeanPaint,
+    /// The full-resolution RGB guide.
+    MeanGuide,
+}
+
+const RES_TAPS: [&str; 4] = ["res0", "res1", "res2", "res3"];
 
 /// Channels whose spatial variance is below this are the ones `eps = 1e-5`
 /// used to pin. The threshold stays `1e-5` even when the norm itself uses
