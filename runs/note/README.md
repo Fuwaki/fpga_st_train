@@ -52,6 +52,7 @@ v6（2026-10-14）只选定了下一版 `tiny_dw` 的结构，见 `v6-tiny-dw-in
 | `v9-guided-overfit.md` | 单图过拟合。4–8 px 卡在 H/8 主干：`film_both` 推到 H/8 后 `e4-8` 从 0.79 掉到 0.22；guided 停在 H/4 后到 0.68 / `e8-16` 0.78。lapvar 比仍是 0.22 对 0.39。零初始化残差门控把笔触抹平 |
 | `v10-whitebox-anime.md` | WhiteBox 动漫、COCO 多图、未见图评估。`b_h4`（788 Mmac）26.66 dB，赢过 `film_both`（1569 Mmac）23.86；H/8 的 `c_v2` 最锐但只是局部滤波。多图上 guide 和跳连都被用起来，v9 的「路径没被用」是单图现象。IN `EPS=1e-5` 压住了 guided 主干，v9 塌掉的四臂都在同一区间。下一步以损失为主：flat / edge / contrast |
 | `v11-whitebox-stroke.md` | 偏色的根因是默认初始化让 IN 前的信号只剩 1e-8 方差，eps 1e-8 把它放大成噪声；修 `pre_in_gain = sqrt2`，eps 留 1e-5。取图、卷积反向、教师逐张三处提速，一步 8.7 s → 1.9 s，cohort 12 臂。学生的 4–16 px 只做了教师改动的 0.21，`stroke = 8` 抬到 0.34；`edge` 放大的是照片纹理 |
+| `v12-whitebox-long.md` | 1000 步太短：同配置 6000 步 4–16 px 0.34 → 0.51，lr 1.5e-3 到 0.64（不加算力），主干 96 0.59，flat 10 + edge 0.5 平坦区 1.25。gate / resid / decoder 加宽没用。描边所有臂停在 0.70，输出形式的上限也只有 0.79。新 `line` 损失（教师边缘加权的带符号梯度 L1）。加大 crop / batch 每像素只快 9–17% |
 
 > **v3 / v4 里有一部分数字已经过时。** 那两版是在"模拟前向没有建模最后一级输出量化"的
 > 代码上测的，absolute 值偏乐观 0.1 dB 量级，而且当时的 head 输出被对称 clamp 到

@@ -5,6 +5,7 @@
 //! - [pixel] -- L1/L2 between the student output and the teacher target
 //! - [gradient_l1] -- pixel-aligned finite-difference L1
 //! - [stroke_l1] -- band-pass L1 at the scales a small decoder can actually paint
+//! - [line] -- signed gradient L1 weighted toward the teacher's edges
 //! - [texture_energy] -- phase-insensitive local amplitude of those bands
 //! - [tv]    -- total-variation regulariser, which is what keeps the output smooth instead
 //!   of speckled (the failure mode small style nets hit)
@@ -87,6 +88,32 @@ pub fn edge<B: Backend>(student: Tensor<B, 4>, teacher: Tensor<B, 4>) -> Tensor<
     let gap = (gt.clone() - covered).clamp_min(0.0);
     let scale = (gt.clone().mean().into_scalar().to_f64() as f32).max(1e-12);
     (gt * gap).mean().div_scalar(scale)
+}
+
+/// Signed gradient L1 on the teacher's lines.
+///
+/// `mean(w · (|dx_s − dx_t| + |dy_s − dy_t|))` with `w = g(t) / mean g(t)` per
+/// image and channel, so `w` averages to 1 and [`gradient_l1`]'s scale carries over.
+/// [`edge`] only reads `g(s)`, so amplifying the photo's own texture paid it off.
+/// Here a gradient in the wrong direction costs as much as a missing one, and a
+/// blurred line pays on every teacher pixel it spreads away from.
+pub fn line<B: Backend>(student: Tensor<B, 4>, teacher: Tensor<B, 4>) -> Tensor<B, 1> {
+    let [_, _, h, w] = student.dims();
+    if h < 2 || w < 2 {
+        return Tensor::zeros([1], &student.device());
+    }
+    let diffs = |x: Tensor<B, 4>| {
+        let dx = x.clone().slice(s![.., .., 0..h - 1, 1..w])
+            - x.clone().slice(s![.., .., 0..h - 1, 0..w - 1]);
+        let dy =
+            x.clone().slice(s![.., .., 1..h, 0..w - 1]) - x.slice(s![.., .., 0..h - 1, 0..w - 1]);
+        (dx, dy)
+    };
+    let (sx, sy) = diffs(student);
+    let (tx, ty) = diffs(teacher);
+    let gt = (tx.clone() * tx.clone() + ty.clone() * ty.clone() + 1e-6).sqrt();
+    let weight = gt.clone() / gt.mean_dim(2).mean_dim(3).clamp_min(1e-6);
+    (weight * ((sx - tx).abs() + (sy - ty).abs())).mean()
 }
 
 /// 16×16 non-overlapping window mean, plus a small variance term.
@@ -304,6 +331,49 @@ mod tests {
         assert!(
             slip < stroke * 0.75,
             "a 2px slip ({slip}) should cost less than missing the wave ({stroke})"
+        );
+    }
+
+    /// Vertical step from 0 to `amp` at column `at`, spread over `width` columns.
+    fn step(h: usize, w: usize, at: usize, width: usize, amp: f32) -> Vec<f32> {
+        (0..h * w)
+            .map(|i| {
+                let x = (i % w) as f32 + 0.5;
+                let t = (x - at as f32) / width as f32 + 0.5;
+                amp * t.clamp(0.0, 1.0)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn line_charges_blur_and_stray_texture_on_the_teachers_edge() {
+        let h = 32;
+        let w = 32;
+        let sharp = image(step(h, w, 16, 1, 0.5), h, w);
+        let blurred = image(step(h, w, 16, 5, 0.5), h, w);
+        let texture: Vec<f32> = step(h, w, 16, 1, 0.5)
+            .iter()
+            .zip(checker(h, w, 0.2))
+            .map(|(a, b)| a + b)
+            .collect();
+        let textured = image(texture, h, w);
+
+        let exact = scalar(line(sharp.clone(), sharp.clone()));
+        let blur = scalar(line(blurred.clone(), sharp.clone()));
+        let tex = scalar(line(textured, sharp.clone()));
+        let grad_blur = scalar(gradient_l1(blurred, sharp));
+
+        assert!(
+            exact < 1e-6,
+            "the teacher itself should cost nothing, got {exact}"
+        );
+        assert!(
+            blur > grad_blur * 4.0,
+            "line ({blur}) should weigh a blurred edge well above gradient_l1 ({grad_blur})"
+        );
+        assert!(
+            tex > 1e-3,
+            "texture that is not the teacher's should cost, got {tex}"
         );
     }
 

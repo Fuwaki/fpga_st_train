@@ -130,6 +130,7 @@ impl Config {
             && self.loss.edge == 0.0
             && self.loss.contrast == 0.0
             && self.loss.stroke == 0.0
+            && self.loss.line == 0.0
             && self.loss.texture == 0.0
             && self.loss.feature == 0.0
             && self.loss.tv == 0.0
@@ -408,6 +409,10 @@ pub struct LossConfig {
     /// Band-pass L1 at 3–9 px and 9–25 px. Asks for brush strokes without the
     /// 1 px conditional-mean trap of `gradient`. 0 disables it.
     pub stroke: f32,
+    /// Signed gradient L1 weighted by the teacher's gradient magnitude: the
+    /// teacher's lines, in the teacher's direction. 0 disables it.
+    #[serde(default)]
+    pub line: f32,
     /// Local band amplitude (4–8 px and 8–16 px). Position inside the window is free.
     /// 0 disables it.
     pub texture: f32,
@@ -433,6 +438,7 @@ impl Default for LossConfig {
             edge: 0.0,
             contrast: 0.0,
             stroke: 0.0,
+            line: 0.0,
             texture: 0.0,
             feature: 0.0,
             tv: 1e-4,

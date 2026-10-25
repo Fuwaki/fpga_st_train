@@ -154,6 +154,7 @@ pub struct TrainStepMetrics {
     pub edge: Option<f64>,
     pub contrast: Option<f64>,
     pub stroke: Option<f64>,
+    pub line: Option<f64>,
     pub texture: Option<f64>,
     pub feature: Option<f64>,
     pub tv: Option<f64>,
@@ -170,6 +171,7 @@ impl TrainStepMetrics {
         insert_opt_f64(map, "edge", self.edge);
         insert_opt_f64(map, "contrast", self.contrast);
         insert_opt_f64(map, "stroke", self.stroke);
+        insert_opt_f64(map, "line", self.line);
         insert_opt_f64(map, "texture", self.texture);
         insert_opt_f64(map, "feature", self.feature);
         insert_opt_f64(map, "tv", self.tv);
@@ -186,6 +188,7 @@ pub struct ValStepMetrics {
     pub edge: Option<f64>,
     pub contrast: Option<f64>,
     pub stroke: Option<f64>,
+    pub line: Option<f64>,
     pub texture: Option<f64>,
     pub feature: Option<f64>,
     pub tv: Option<f64>,
@@ -200,6 +203,7 @@ impl ValStepMetrics {
         insert_opt_f64(map, "val_edge", self.edge);
         insert_opt_f64(map, "val_contrast", self.contrast);
         insert_opt_f64(map, "val_stroke", self.stroke);
+        insert_opt_f64(map, "val_line", self.line);
         insert_opt_f64(map, "val_texture", self.texture);
         insert_opt_f64(map, "val_feature", self.feature);
         insert_opt_f64(map, "val_tv", self.tv);

@@ -285,6 +285,7 @@ struct LossWeights {
     edge: f32,
     contrast: f32,
     stroke: f32,
+    line: f32,
     texture: f32,
     feature: f32,
     tv: f32,
@@ -299,6 +300,7 @@ impl LossWeights {
             edge: loss.edge,
             contrast: loss.contrast,
             stroke: loss.stroke,
+            line: loss.line,
             texture: loss.texture,
             feature: loss.feature,
             tv: loss.tv,
@@ -307,13 +309,14 @@ impl LossWeights {
 
     fn formula(&self) -> String {
         format!(
-            "{}*L1 + {}*grad + {}*flat + {}*edge + {}*contrast + {}*stroke + {}*tex + {}*TV",
+            "{}*L1 + {}*grad + {}*flat + {}*edge + {}*contrast + {}*stroke + {}*line + {}*tex + {}*TV",
             self.pixel,
             self.gradient,
             self.flat,
             self.edge,
             self.contrast,
             self.stroke,
+            self.line,
             self.texture,
             self.tv
         )
@@ -328,6 +331,7 @@ struct LossParts<B: Backend> {
     edge: Tensor<B, 1>,
     contrast: Tensor<B, 1>,
     stroke: Option<Tensor<B, 1>>,
+    line: Option<Tensor<B, 1>>,
     texture: Option<Tensor<B, 1>>,
     feature: Option<Tensor<B, 1>>,
     tv: Option<Tensor<B, 1>>,
@@ -351,6 +355,7 @@ impl<B: Backend> LossParts<B> {
                 .stroke
                 .as_ref()
                 .map(|t| t.clone().into_scalar().to_f64()),
+            line: self.line.as_ref().map(|t| t.clone().into_scalar().to_f64()),
             texture: self
                 .texture
                 .as_ref()
@@ -378,6 +383,7 @@ impl<B: Backend> LossParts<B> {
                 .stroke
                 .as_ref()
                 .map(|t| t.clone().into_scalar().to_f64()),
+            line: self.line.as_ref().map(|t| t.clone().into_scalar().to_f64()),
             texture: self
                 .texture
                 .as_ref()
@@ -409,6 +415,7 @@ fn forward_loss<B: Backend, M: StudentModel<B> + Quantizable<B>>(
     let mut total = pixel.clone().mul_scalar(weights.pixel);
     let mut gradient = None;
     let mut stroke = None;
+    let mut line = None;
     let mut texture = None;
     let mut feature = None;
     let mut tv = None;
@@ -450,6 +457,11 @@ fn forward_loss<B: Backend, M: StudentModel<B> + Quantizable<B>>(
         stroke = Some(term.clone());
         total = total + term.mul_scalar(weights.stroke);
     }
+    if weights.line > 0.0 {
+        let term = losses::line(output.clone(), target.clone());
+        line = Some(term.clone());
+        total = total + term.mul_scalar(weights.line);
+    }
     if weights.texture > 0.0 {
         let term = losses::texture_energy(output.clone(), target.clone());
         texture = Some(term.clone());
@@ -481,6 +493,7 @@ fn forward_loss<B: Backend, M: StudentModel<B> + Quantizable<B>>(
         edge,
         contrast,
         stroke,
+        line,
         texture,
         feature,
         tv,
@@ -582,7 +595,7 @@ where
                 String::new()
             };
             println!(
-                "{prefix}step {step:>7}/{:<7} loss {:>9.5}  l1 {:.5}  grad {:.5}  flat {:.5}  edge {:.5}  contrast {:.5}  stroke {:.5}  tex {:.5}  feat {:.5}  tv {:.5}  lr {:.3e}  {:.2} step/s  {:.1} s",
+                "{prefix}step {step:>7}/{:<7} loss {:>9.5}  l1 {:.5}  grad {:.5}  flat {:.5}  edge {:.5}  contrast {:.5}  stroke {:.5}  line {:.5}  tex {:.5}  feat {:.5}  tv {:.5}  lr {:.3e}  {:.2} step/s  {:.1} s",
                 iterations,
                 metrics.loss,
                 metrics.l1.unwrap_or(0.0),
@@ -591,6 +604,7 @@ where
                 metrics.edge.unwrap_or(0.0),
                 metrics.contrast.unwrap_or(0.0),
                 metrics.stroke.unwrap_or(0.0),
+                metrics.line.unwrap_or(0.0),
                 metrics.texture.unwrap_or(0.0),
                 metrics.feature.unwrap_or(0.0),
                 metrics.tv.unwrap_or(0.0),
@@ -1020,7 +1034,7 @@ where
                     String::new()
                 };
                 println!(
-                    "{prefix}step {step:>7}/{:<7} loss {:>9.5}  l1 {:.5}  grad {:.5}  flat {:.5}  edge {:.5}  contrast {:.5}  stroke {:.5}  tex {:.5}  feat {:.5}  tv {:.5}  lr {:.3e}  {:.2} step/s  {:.1} s",
+                    "{prefix}step {step:>7}/{:<7} loss {:>9.5}  l1 {:.5}  grad {:.5}  flat {:.5}  edge {:.5}  contrast {:.5}  stroke {:.5}  line {:.5}  tex {:.5}  feat {:.5}  tv {:.5}  lr {:.3e}  {:.2} step/s  {:.1} s",
                     iterations,
                     metrics.loss,
                     metrics.l1.unwrap_or(0.0),
@@ -1029,6 +1043,7 @@ where
                     metrics.edge.unwrap_or(0.0),
                     metrics.contrast.unwrap_or(0.0),
                     metrics.stroke.unwrap_or(0.0),
+                    metrics.line.unwrap_or(0.0),
                     metrics.texture.unwrap_or(0.0),
                     metrics.feature.unwrap_or(0.0),
                     metrics.tv.unwrap_or(0.0),
