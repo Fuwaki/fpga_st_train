@@ -1,1 +1,20 @@
 /target
+
+# Regenerable training artefacts
+/runs/*
+!/runs/note/
+!/runs/note/**
+
+/experiments/*/trials/
+/experiments/*/log/
+/experiments/*/aggregate/
+
+# Legacy log dump (single-shot train.sh)
+/runs/log/
+
+# Probe dumps (regenerable with examples/decoder_trace.rs, examples/trunk_boundary.rs)
+/experiments/*/analysis/**/*.f32
+# Per-study console capture
+/experiments/*/run.out
+/deliverables/gallery/_cache/
+__pycache__/
