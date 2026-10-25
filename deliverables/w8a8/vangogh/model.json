@@ -1,17 +1,22 @@
 {
-  "arch": "tiny",
+  "arch": "tiny_dw",
   "options": {
     "base": 32,
-    "res_blocks": 4
+    "color": "film_both",
+    "fine": 24,
+    "mid": 48,
+    "plugin": "in",
+    "plugin_site": "h4",
+    "res_blocks": 1
   },
   "meta": {
     "bits": "W8A8",
     "calibration_batches": 20,
     "calibration_safety": 1.0,
-    "iterations": 4000,
-    "run": "vangogh",
-    "style": "configs/../../style-transfer/data/styles/vangogh/starry_night.jpg",
-    "weight_bytes": 375824,
+    "iterations": 500,
+    "run": "film_both",
+    "style": "experiments/tiny_dw_vangogh_film/configs/../../../../style-transfer/data/styles/vangogh/starry_night.jpg",
+    "weight_bytes": 22736,
     "weight_packing": "i8-x1"
   }
 }

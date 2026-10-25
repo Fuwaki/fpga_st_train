@@ -1,0 +1,25 @@
+{
+  "arch": "tiny_dw",
+  "options": {
+    "base": 32,
+    "color": "film_both",
+    "encoder": "lut_dw",
+    "fine": 24,
+    "lut_bits": 4,
+    "lut_hidden": 4,
+    "mid": 48,
+    "plugin": "in",
+    "plugin_site": "h4",
+    "res_blocks": 1
+  },
+  "meta": {
+    "bits": "W8A8",
+    "calibration_batches": 20,
+    "calibration_safety": 1.0,
+    "iterations": 500,
+    "run": "lut_dw_b4",
+    "style": "experiments/tiny_dw_vangogh_lut_dw/configs/../../../../style-transfer/data/styles/vangogh/starry_night.jpg",
+    "weight_bytes": 21872,
+    "weight_packing": "i8-x1"
+  }
+}
