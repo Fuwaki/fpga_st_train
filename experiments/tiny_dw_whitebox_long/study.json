@@ -1,0 +1,116 @@
+{
+  "id": "tiny_dw_whitebox_long",
+  "base_config": "experiments/tiny_dw_whitebox_long/base.json",
+  "trials": [
+    {
+      "id": "a_st8",
+      "patch": {}
+    },
+    {
+      "id": "b_st8_seed1",
+      "patch": {
+        "run": {
+          "seed": 1
+        }
+      }
+    },
+    {
+      "id": "c_base",
+      "patch": {
+        "loss": {
+          "stroke": 0
+        }
+      }
+    },
+    {
+      "id": "d_lr15",
+      "patch": {
+        "optim": {
+          "learning_rate": 0.0015,
+          "schedule": {
+            "final_lr": 0.00015000000000000001
+          }
+        }
+      }
+    },
+    {
+      "id": "e_lr3",
+      "patch": {
+        "optim": {
+          "learning_rate": 0.0003,
+          "schedule": {
+            "final_lr": 2.9999999999999997e-05
+          }
+        }
+      }
+    },
+    {
+      "id": "f_res2",
+      "patch": {
+        "student": {
+          "options": {
+            "res_blocks": 2
+          }
+        }
+      }
+    },
+    {
+      "id": "g_trunk96",
+      "patch": {
+        "student": {
+          "options": {
+            "trunk": 96
+          }
+        }
+      }
+    },
+    {
+      "id": "h_wide_dec",
+      "patch": {
+        "student": {
+          "options": {
+            "up_h4": 48,
+            "up_h2": 64
+          }
+        }
+      }
+    },
+    {
+      "id": "i_gate",
+      "patch": {
+        "student": {
+          "options": {
+            "guide_mix": "gate"
+          }
+        }
+      }
+    },
+    {
+      "id": "j_resid",
+      "patch": {
+        "student": {
+          "options": {
+            "guide_mix": "resid"
+          }
+        }
+      }
+    },
+    {
+      "id": "k_flat3",
+      "patch": {
+        "loss": {
+          "flat": 3
+        }
+      }
+    },
+    {
+      "id": "l_flat10_edge05",
+      "patch": {
+        "loss": {
+          "flat": 10,
+          "edge": 0.5
+        }
+      }
+    }
+  ]
+}

@@ -696,7 +696,8 @@ fn shared_recipe(config: &Config) -> serde_json::Value {
     serde_json::json!({
         "data": config.data,
         "teacher": config.teacher,
-        "optim": config.optim,
+        // Each slot builds its own Adam and schedule; only the step count is shared.
+        "iterations": config.optim.iterations,
         "quant": config.quant,
         "arch": config.student.arch,
         "device": config.run.device,
@@ -724,8 +725,8 @@ where
 
 /// One teacher forward per step, then a backward pass for each student.
 ///
-/// Every config must share the data, teacher, optimiser, and step budget.
-/// Loss weights and `run.seed` may differ. The seed draws that student's
+/// Every config must share the data, teacher, and step budget. Loss weights,
+/// optimiser settings, and `run.seed` may differ. The seed draws that student's
 /// initial weights; crops follow the first config's seed. Each student keeps
 /// its own formula, Adam state, log, and output directory.
 pub fn run_all<M, F>(
