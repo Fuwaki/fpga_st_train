@@ -1,0 +1,67 @@
+{
+  "run": {
+    "name": "overfit_full16",
+    "output_dir": "../trials/full16",
+    "seed": 0,
+    "device": "d0",
+    "log_every": 100,
+    "val_every": 0,
+    "val_batch_size": 1,
+    "checkpoint_every": 0,
+    "sample_every": 200,
+    "sample_content": "../../../../style-transfer/demo_inputs/city.jpg",
+    "sample_size": 640
+  },
+  "data": {
+    "content_dir": "../../../../style-transfer/demo_inputs/city.jpg",
+    "hf": null,
+    "pseudo_gt_dir": null,
+    "crop": 192,
+    "overfit_long_edge": 640,
+    "batch_size": 1,
+    "limit": null
+  },
+  "teacher": {
+    "weights_dir": "../../../../teacher-eval/MicroAST/models",
+    "style": "../../../../style-transfer/data/styles/vangogh/starry_night.jpg",
+    "style_size": 256,
+    "alpha": 1,
+    "enabled": true
+  },
+  "loss": {
+    "pixel": 1,
+    "gradient": 2,
+    "stroke": 0,
+    "texture": 0,
+    "feature": 0,
+    "tv": 0,
+    "perceptual": 0,
+    "style": 0,
+    "vgg_weights": null
+  },
+  "optim": {
+    "learning_rate": 0.0006,
+    "beta_1": 0.9,
+    "beta_2": 0.999,
+    "epsilon": 1e-05,
+    "iterations": 1000,
+    "schedule": {
+      "kind": "constant"
+    },
+    "grad_clip": null
+  },
+  "student": {
+    "arch": "tiny_dw_guided",
+    "options": {
+      "base": 32,
+      "trunk": 64,
+      "res_blocks": 1,
+      "up_h4": 32,
+      "up_h2": 48,
+      "guide": 8,
+      "full": 16,
+      "film_h2": 1,
+      "film_full": 0
+    }
+  }
+}

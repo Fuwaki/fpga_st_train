@@ -1,0 +1,18 @@
+{
+  "id": "tiny_dw_vangogh_lut",
+  "base_config": "experiments/tiny_dw_vangogh_film/configs/film_both.json",
+  "trials": [
+    {
+      "id": "lut_b8",
+      "patch": {
+        "student": {
+          "options": {
+            "encoder": "lut",
+            "lut_hidden": 4,
+            "lut_bits": 8
+          }
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,50 @@
+{
+  "id": "tiny_dw_whitebox_anime",
+  "base_config": "configs/dw_film_whitebox.json",
+  "trials": [
+    {
+      "id": "a_film",
+      "patch": {}
+    },
+    {
+      "id": "b_h4",
+      "patch": {
+        "student": {
+          "arch": "tiny_dw_guided",
+          "options": {
+            "base": 32,
+            "trunk": 64,
+            "res_blocks": 1,
+            "up_h4": 32,
+            "up_h2": 48,
+            "guide": 8,
+            "full": 0,
+            "film_h2": 1,
+            "film_full": 0,
+            "trunk_at": "h4",
+            "h2_guide": 16
+          }
+        }
+      }
+    },
+    {
+      "id": "c_v2",
+      "patch": {
+        "student": {
+          "arch": "tiny_dw_guided",
+          "options": {
+            "base": 32,
+            "trunk": 64,
+            "res_blocks": 1,
+            "up_h4": 32,
+            "up_h2": 48,
+            "guide": 8,
+            "full": 0,
+            "film_h2": 1,
+            "film_full": 0
+          }
+        }
+      }
+    }
+  ]
+}

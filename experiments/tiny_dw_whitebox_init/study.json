@@ -1,0 +1,66 @@
+{
+  "id": "tiny_dw_whitebox_init",
+  "base_config": "experiments/tiny_dw_whitebox_init/base.json",
+  "trials": [
+    {
+      "id": "a_base",
+      "patch": {}
+    },
+    {
+      "id": "b_look",
+      "patch": {
+        "loss": {
+          "flat": 10,
+          "edge": 0.5
+        }
+      }
+    },
+    {
+      "id": "c_seed",
+      "patch": {
+        "run": {
+          "seed": 1
+        },
+        "loss": {
+          "flat": 10,
+          "edge": 0.5
+        }
+      }
+    },
+    {
+      "id": "d_gain",
+      "patch": {
+        "student": {
+          "options": {
+            "pre_in_gain": "sqrt2"
+          }
+        }
+      }
+    },
+    {
+      "id": "e_gain_look",
+      "patch": {
+        "student": {
+          "options": {
+            "pre_in_gain": "sqrt2"
+          }
+        },
+        "loss": {
+          "flat": 10,
+          "edge": 0.5
+        }
+      }
+    },
+    {
+      "id": "f_gain_eps",
+      "patch": {
+        "student": {
+          "options": {
+            "pre_in_gain": "sqrt2",
+            "in_eps": 1e-8
+          }
+        }
+      }
+    }
+  ]
+}

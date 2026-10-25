@@ -1,33 +1,60 @@
-# Compute backend: wgpu, and why
+# Compute backend
 
 ## The rule
 
-This project uses exactly one GPU backend: burn `wgpu` feature (WGSL compute
-shaders, compiled by naga, dispatched through whatever native API `wgpu` picks
-on the host -- Vulkan on Linux, Metal on macOS, DX12 on Windows). This is fixed
-project policy, independent of which machine it is built on. `default = ["wgpu"]`
-in `Cargo.toml`; `src/backend.rs` wires it to `InferBackend` /
-`TrainBackend`.
+Default training backend is burn `cuda` (`default = ["cuda"]` in `Cargo.toml`).
+`src/backend.rs` wires that to `InferBackend` / `TrainBackend`. On this machine
+the Tesla V100-SXM2-16GB is CUDA ordinal 0, so pass `--device d0`.
 
-Do not add or switch to burn other GPU features (`vulkan`, `cuda`, `rocm`,
-`metal`) without re-reading this document and re-running the validation below
-on the new machine first.
+Vulkan stays available for an AMD GPU, and wgpu stays available as the WGSL path.
+Both are opt-in and are not compiled into the default binary:
 
-## Why wgpu and nothing else
+```bash
+cargo run --release --no-default-features --features cuda -- --device d0 train --config ...
+cargo run --release --no-default-features --features vulkan -- --device d0 train --config ...
+cargo run --release --no-default-features --features wgpu -- --device d0 train --config ...
+cargo run --release --no-default-features --features ndarray -- ...
+```
 
-The project deliberately avoids ROCm (no official/stable AMD GPU support in
-most ML frameworks, and this is being developed on an AMD RX 580) and avoids
-being locked to a specific vendor SDK in general, since the trained student
-model is meant to move to whatever machine is available for long training
-runs. `wgpu` is the one backend that:
+`dN` on a CUDA build is the `nvidia-smi` index. On a vulkan/wgpu build it is the
+N-th discrete adapter. When a Vega and the V100 are both present, wgpu calls the
+Vega `d0` and the V100 `d1`. CUDA only sees the V100, as `d0`.
 
-- needs no vendor SDK to build or run (no ROCm, no CUDA toolkit, just a
-  Vulkan/Metal/DX12 driver that is normally already present),
-- is, by measurement on this machine, the only GPU path that produces
-  numerically correct results (see below),
-- is portable across vendors by construction: the same compiled feature
-  works on the AMD RX 580 here, on the NVIDIA Tesla P4 also in this machine,
-  and should work unmodified on whatever GPU a future training machine has.
+## Why CUDA is the default now
+
+Training runs are on the NVIDIA card. CUDA is the CubeCL path that can use the
+NVIDIA driver directly, including cooperative-matrix kernels where the GPU has
+them. The AMD Vega is no longer the machine these runs are planned around.
+Vulkan remains the explicit fallback when a run does have to go there.
+
+## Driver 580, compiler pinned to CUDA 12.8
+
+`nvidia-smi` reports `CUDA Version: 13.0` (driver 580.178.04) on a Tesla
+V100-SXM2-16GB, compute 7.0. `/opt/cuda` is toolkit 13.4. Two constraints
+meet here:
+
+- 13.4 PTX fails at launch with `CUDA_ERROR_UNSUPPORTED_PTX_VERSION`. The
+  driver only accepts PTX up to the 13.0 line.
+- CUDA 13 nvrtc's lowest `--gpu-architecture` is `sm_75`. `sm_70` is rejected,
+  so that compiler cannot emit a kernel for this V100.
+
+`scripts/cuda_env.sh` therefore loads the CUDA 12.8 nvrtc redistributable at
+`/data/competition/2026fpga/cuda-12.8/prefix` and sets `CUDA_PATH` to the
+matching headers. `.cargo/config.toml` sets `CUDARC_CUDA_VERSION=12080`.
+12.8 still warns that anything before `sm_75` is deprecated, then emits PTX
+the driver loads. Launch training through `scripts/train.sh` or
+`scripts/study_run.sh`, which source `cuda_env.sh`.
+
+## What the other features are for
+
+ROCm is still not a backend here. The AMD path that was measured correct is
+`wgpu` (WGSL). `vulkan` (SPIR-V) is faster on NVIDIA and is the named fallback,
+but it is numerically wrong on RADV / the RX 580 (see below). Use `wgpu` if a
+run has to land on that card and the pictures have to match the CPU oracle.
+
+`wgpu` needs no CUDA toolkit. The default `cuda` build compiles kernels with
+the CUDA 12.8 prefix from `scripts/cuda_env.sh`, not the distro tree at
+`/opt/cuda`.
 
 ## Measured: burn `vulkan` (SPIR-V/CubeCL) is broken on this machine
 
@@ -63,17 +90,18 @@ from the original PyTorch MicroAST (`teacher-eval/MicroAST`); PSNR should read
 The failure is specific to the RADV/Mesa SPIR-V path
 on this AMD card -- almost certainly a CubeCL-SPIR-V-or-driver bug, not
 something fixable from this project. `wgpu` (WGSL) does not have this bug on
-either GPU in this machine, which is the other reason it is the fixed choice,
-not just the portable one.
+either GPU in this machine. That is why an AMD run should use `wgpu`, not
+`vulkan`, when correctness matters.
 
-## No tensor cores, on any GPU, ever -- and that is fine
+## Tensor cores exist only on the cuda and vulkan builds
 
 WGSL has no cooperative-matrix instruction, and naga (the compiler `wgpu`
 uses for WGSL) cannot lower to one; `cubecl-wgpu`'s WGSL compiler panics if a
 kernel ever tries
 (`compiler/wgsl/compiler.rs`: `"Cooperative matrix-multiply and accumulate
 isn't supported on wgpu."`). Only the `vulkan` and `cuda` burn features can
-reach CubeCL's cmma-based fast kernels. Concretely, this means:
+reach CubeCL's cmma-based fast kernels. The bullets below are the `wgpu` feature
+only; the default `cuda` build can select those cmma kernels. Concretely, on wgpu:
 
 - every convolution -- forward and the weight-gradient backward pass --
   runs through CubeCL naive `DirectConv2dKernel` fp32 path, on any GPU, on
@@ -93,8 +121,7 @@ small (16/32/64 channel, a handful of 3x3/1x1 convs), fp32 correctness is
 worth more than half-precision tensor-core throughput at this scale, and even
 on the weakest GPU in this machine (RX 580, no tensor cores, fp32 only) a
 training step is already sub-second. A faster GPU later helps through raw
-throughput scaling, which is the only kind of speedup this backend choice
-was ever going to give.
+throughput scaling.
 
 ## Before training on a new machine: re-validate, do not assume
 
@@ -158,8 +185,10 @@ and (for `stylize`) image encode/decode that have nothing to do with the GPU.
 ## PCIe / T10 host↔device traffic (2026-10-10)
 
 Tesla T10 on this box often trains at **PCIe Gen1–3 x4** (Vega56 is Gen3 x16). Prefer
-`--device d1` with a **vulkan** build (`cargo build --release --no-default-features --features vulkan`).
-`d0` = Vega (RADV), `d1` = T10 (NVIDIA). `CUDA_VISIBLE_DEVICES` does not apply to burn/wgpu.
+`--device d0` with a **cuda** build (`cargo build --release --no-default-features --features cuda`).
+That ordinal is `nvidia-smi` index 0, the T10 on this machine. A vulkan/wgpu build
+still uses discrete-adapter order: `d0` = Vega, `d1` = T10, when both are installed.
+`CUDA_VISIBLE_DEVICES` applies to the CUDA build and does not apply to vulkan/wgpu.
 
 ### What hurt on x4
 
@@ -195,3 +224,38 @@ the big win is cold start + removing sync/decode overhead. With **online teacher
 
 Keeping teacher/student tensors on-GPU (`from_inner`) avoids that 29 ms/activation bounce on T10.
 
+
+## V100 cohort throughput (2026-10-25)
+
+Setup: `b_h4`, batch 32, crop 192, WhiteBox teacher on the Vega, COCO from the HF parquet
+cache. Wall time per training step:
+
+| | before | after |
+|---|---:|---:|
+| 1 student, no teacher (pseudo-GT on disk) | 1.11 s | 0.15 s |
+| 6 students, no teacher | 6.75 s | 0.94 s |
+| 12 students, no teacher | — | 1.76 s |
+| 12 students, online WhiteBox, COCO | 8.7 s | 1.9 s |
+
+Three causes, three fixes:
+
+1. **Data, about 7 s per step.** Each COCO shard is a single 480 MB row group with no page
+   index, and every sample re-decoded the image column from row 0. `src/data/hf.rs` now
+   packs each shard's JPEG bytes once into `<hf cache>/../fpga_st_train/jpeg-packs/`
+   (4.5 GB for 10 shards, about 40 s the first time) and reads one positioned slice per
+   sample: 26–69 ms per batch. The bytes match the parquet exactly.
+2. **Student backward, 0.92 s of each student's 1.1 s.** CubeCL's `conv2d` backward is
+   30–280× its forward for depthwise, 1×1 and few-channel dense convolutions.
+   `src/student/conv.rs` expresses those as shifted slices and batched matmuls (same sums,
+   about 4e-7 apart). Per-op table in that file.
+3. **Teacher, per-image calls.** WhiteBox ran as 32 `session.run`s of batch 1: 1017 ms per
+   batch on the Vega, about 25% busy. The batch dimension is now rewritten to be dynamic and
+   the batch runs in one call: 381 ms, bit-identical.
+
+After this the step is the students' own GPU time, about 0.15 s each. Twelve students per
+cohort fit in 3.7 GB.
+
+Checked and not worth keeping: `NoCheckpointing` instead of `BalancedCheckpointing` (same
+time), skipping zero-weight `flat`/`edge`/`contrast` (4%), and moving the teacher to the V100
+via ONNX Runtime CUDA (its 33 ms per batch would be under 2% of a step; on sm_70 it also
+needs onnxruntime-gpu built against CUDA 12 and cuDNN ≤ 9.10).

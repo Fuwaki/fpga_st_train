@@ -1,0 +1,391 @@
+{
+  "id": "tiny_dw_vangogh_plugin",
+  "base_config": "configs/dw_plugin_base.json",
+  "trials": [
+    {
+      "id": "00_base",
+      "patch": {
+        "student": {
+          "options": {
+            "plugin": "none",
+            "plugin_site": "h4"
+          }
+        }
+      }
+    },
+    {
+      "id": "affine_h4",
+      "patch": {
+        "student": {
+          "options": {
+            "plugin": "affine",
+            "plugin_site": "h4"
+          }
+        }
+      }
+    },
+    {
+      "id": "affine_h2",
+      "patch": {
+        "student": {
+          "options": {
+            "plugin": "affine",
+            "plugin_site": "h2"
+          }
+        }
+      }
+    },
+    {
+      "id": "affine_full",
+      "patch": {
+        "student": {
+          "options": {
+            "plugin": "affine",
+            "plugin_site": "full"
+          }
+        }
+      }
+    },
+    {
+      "id": "in_h4",
+      "patch": {
+        "student": {
+          "options": {
+            "plugin": "in",
+            "plugin_site": "h4"
+          }
+        }
+      }
+    },
+    {
+      "id": "in_h2",
+      "patch": {
+        "student": {
+          "options": {
+            "plugin": "in",
+            "plugin_site": "h2"
+          }
+        }
+      }
+    },
+    {
+      "id": "in_full",
+      "patch": {
+        "student": {
+          "options": {
+            "plugin": "in",
+            "plugin_site": "full"
+          }
+        }
+      }
+    },
+    {
+      "id": "ln_h4",
+      "patch": {
+        "student": {
+          "options": {
+            "plugin": "ln",
+            "plugin_site": "h4"
+          }
+        }
+      }
+    },
+    {
+      "id": "ln_h2",
+      "patch": {
+        "student": {
+          "options": {
+            "plugin": "ln",
+            "plugin_site": "h2"
+          }
+        }
+      }
+    },
+    {
+      "id": "ln_full",
+      "patch": {
+        "student": {
+          "options": {
+            "plugin": "ln",
+            "plugin_site": "full"
+          }
+        }
+      }
+    },
+    {
+      "id": "se_h4",
+      "patch": {
+        "student": {
+          "options": {
+            "plugin": "se",
+            "plugin_site": "h4"
+          }
+        }
+      }
+    },
+    {
+      "id": "se_h2",
+      "patch": {
+        "student": {
+          "options": {
+            "plugin": "se",
+            "plugin_site": "h2"
+          }
+        }
+      }
+    },
+    {
+      "id": "se_full",
+      "patch": {
+        "student": {
+          "options": {
+            "plugin": "se",
+            "plugin_site": "full"
+          }
+        }
+      }
+    },
+    {
+      "id": "film_h4",
+      "patch": {
+        "student": {
+          "options": {
+            "plugin": "film",
+            "plugin_site": "h4"
+          }
+        }
+      }
+    },
+    {
+      "id": "film_h2",
+      "patch": {
+        "student": {
+          "options": {
+            "plugin": "film",
+            "plugin_site": "h2"
+          }
+        }
+      }
+    },
+    {
+      "id": "film_full",
+      "patch": {
+        "student": {
+          "options": {
+            "plugin": "film",
+            "plugin_site": "full"
+          }
+        }
+      }
+    },
+    {
+      "id": "eca_h4",
+      "patch": {
+        "student": {
+          "options": {
+            "plugin": "eca",
+            "plugin_site": "h4"
+          }
+        }
+      }
+    },
+    {
+      "id": "eca_h2",
+      "patch": {
+        "student": {
+          "options": {
+            "plugin": "eca",
+            "plugin_site": "h2"
+          }
+        }
+      }
+    },
+    {
+      "id": "eca_full",
+      "patch": {
+        "student": {
+          "options": {
+            "plugin": "eca",
+            "plugin_site": "full"
+          }
+        }
+      }
+    },
+    {
+      "id": "grn_h4",
+      "patch": {
+        "student": {
+          "options": {
+            "plugin": "grn",
+            "plugin_site": "h4"
+          }
+        }
+      }
+    },
+    {
+      "id": "grn_h2",
+      "patch": {
+        "student": {
+          "options": {
+            "plugin": "grn",
+            "plugin_site": "h2"
+          }
+        }
+      }
+    },
+    {
+      "id": "grn_full",
+      "patch": {
+        "student": {
+          "options": {
+            "plugin": "grn",
+            "plugin_site": "full"
+          }
+        }
+      }
+    },
+    {
+      "id": "ca_h4",
+      "patch": {
+        "student": {
+          "options": {
+            "plugin": "ca",
+            "plugin_site": "h4"
+          }
+        }
+      }
+    },
+    {
+      "id": "ca_h2",
+      "patch": {
+        "student": {
+          "options": {
+            "plugin": "ca",
+            "plugin_site": "h2"
+          }
+        }
+      }
+    },
+    {
+      "id": "ca_full",
+      "patch": {
+        "student": {
+          "options": {
+            "plugin": "ca",
+            "plugin_site": "full"
+          }
+        }
+      }
+    },
+    {
+      "id": "frelu_h4",
+      "patch": {
+        "student": {
+          "options": {
+            "plugin": "frelu",
+            "plugin_site": "h4"
+          }
+        }
+      }
+    },
+    {
+      "id": "frelu_h2",
+      "patch": {
+        "student": {
+          "options": {
+            "plugin": "frelu",
+            "plugin_site": "h2"
+          }
+        }
+      }
+    },
+    {
+      "id": "frelu_full",
+      "patch": {
+        "student": {
+          "options": {
+            "plugin": "frelu",
+            "plugin_site": "full"
+          }
+        }
+      }
+    },
+    {
+      "id": "dw7_h4",
+      "patch": {
+        "student": {
+          "options": {
+            "plugin": "dw7",
+            "plugin_site": "h4"
+          }
+        }
+      }
+    },
+    {
+      "id": "dw7_h2",
+      "patch": {
+        "student": {
+          "options": {
+            "plugin": "dw7",
+            "plugin_site": "h2"
+          }
+        }
+      }
+    },
+    {
+      "id": "dw7_full",
+      "patch": {
+        "student": {
+          "options": {
+            "plugin": "dw7",
+            "plugin_site": "full"
+          }
+        }
+      }
+    },
+    {
+      "id": "simam_h4",
+      "patch": {
+        "student": {
+          "options": {
+            "plugin": "simam",
+            "plugin_site": "h4"
+          }
+        }
+      }
+    },
+    {
+      "id": "simam_h2",
+      "patch": {
+        "student": {
+          "options": {
+            "plugin": "simam",
+            "plugin_site": "h2"
+          }
+        }
+      }
+    },
+    {
+      "id": "simam_full",
+      "patch": {
+        "student": {
+          "options": {
+            "plugin": "simam",
+            "plugin_site": "full"
+          }
+        }
+      }
+    },
+    {
+      "id": "shuffle",
+      "patch": {
+        "student": {
+          "options": {
+            "plugin": "shuffle",
+            "plugin_site": "h4"
+          }
+        }
+      }
+    }
+  ]
+}

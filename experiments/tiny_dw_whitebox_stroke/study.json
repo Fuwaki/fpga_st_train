@@ -1,0 +1,110 @@
+{
+  "id": "tiny_dw_whitebox_stroke",
+  "base_config": "experiments/tiny_dw_whitebox_stroke/base.json",
+  "trials": [
+    {
+      "id": "a_base",
+      "patch": {}
+    },
+    {
+      "id": "b_st4",
+      "patch": {
+        "loss": {
+          "stroke": 4
+        }
+      }
+    },
+    {
+      "id": "c_st8",
+      "patch": {
+        "loss": {
+          "stroke": 8
+        }
+      }
+    },
+    {
+      "id": "d_st16",
+      "patch": {
+        "loss": {
+          "stroke": 16
+        }
+      }
+    },
+    {
+      "id": "e_st8_g05",
+      "patch": {
+        "loss": {
+          "stroke": 8,
+          "gradient": 0.5
+        }
+      }
+    },
+    {
+      "id": "f_st8_g0",
+      "patch": {
+        "loss": {
+          "stroke": 8,
+          "gradient": 0
+        }
+      }
+    },
+    {
+      "id": "g_st8_flat",
+      "patch": {
+        "loss": {
+          "stroke": 8,
+          "flat": 3
+        }
+      }
+    },
+    {
+      "id": "h_st8_edge",
+      "patch": {
+        "loss": {
+          "stroke": 8,
+          "edge": 2
+        }
+      }
+    },
+    {
+      "id": "i_st8_look",
+      "patch": {
+        "loss": {
+          "stroke": 8,
+          "flat": 3,
+          "edge": 2
+        }
+      }
+    },
+    {
+      "id": "j_st16_g05_look",
+      "patch": {
+        "loss": {
+          "stroke": 16,
+          "gradient": 0.5,
+          "flat": 3,
+          "edge": 2
+        }
+      }
+    },
+    {
+      "id": "k_st8_seed1",
+      "patch": {
+        "loss": {
+          "stroke": 8
+        },
+        "run": {
+          "seed": 1
+        }
+      }
+    },
+    {
+      "id": "l_base_seed1",
+      "patch": {
+        "run": {
+          "seed": 1
+        }
+      }
+    }
+  ]
+}

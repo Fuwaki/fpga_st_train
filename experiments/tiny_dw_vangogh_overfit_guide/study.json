@@ -1,0 +1,27 @@
+{
+  "id": "tiny_dw_vangogh_overfit_guide",
+  "base_config": "experiments/tiny_dw_vangogh_overfit/configs/v2.json",
+  "trials": [
+    {
+      "id": "h2_guide",
+      "patch": {
+        "optim": { "iterations": 1000 },
+        "student": { "options": { "h2_guide": 16 } }
+      }
+    },
+    {
+      "id": "guide_k5",
+      "patch": {
+        "optim": { "iterations": 1000 },
+        "student": { "options": { "guide_kernel": 5 } }
+      }
+    },
+    {
+      "id": "guide_gate",
+      "patch": {
+        "optim": { "iterations": 1000 },
+        "student": { "options": { "guide_mix": "gate" } }
+      }
+    }
+  ]
+}

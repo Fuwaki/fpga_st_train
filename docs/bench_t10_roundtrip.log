@@ -1,0 +1,8 @@
+device d1  tensor [4, 64, 128, 128]  (16.00 MiB f32)
+into_data+from_data roundtrip: 29.263 ms/iter  (~1.15 GB/s effective two-way)
+on-device add_scalar chain:   0.443 ms/iter
+roundtrip / on-device ratio:   66×
+device d0  tensor [4, 64, 128, 128]  (16.00 MiB f32)
+into_data+from_data roundtrip: 14.326 ms/iter  (~2.34 GB/s effective two-way)
+on-device add_scalar chain:   0.270 ms/iter
+roundtrip / on-device ratio:   53×

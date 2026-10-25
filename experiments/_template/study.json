@@ -1,0 +1,14 @@
+{
+  "id": "REPLACE_STUDY_ID",
+  "base_config": "configs/dw_study_base.json",
+  "trials": [
+    {
+      "id": "example_trial",
+      "patch": {
+        "optim": {
+          "learning_rate": 0.0006
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,29 @@
+{
+  "id": "tiny_dw_whitebox_look",
+  "base_config": "experiments/tiny_dw_whitebox_look/base.json",
+  "trials": [
+    {
+      "id": "a_base",
+      "patch": {}
+    },
+    {
+      "id": "b_look",
+      "patch": {
+        "loss": {
+          "flat": 10,
+          "edge": 0.5
+        }
+      }
+    },
+    {
+      "id": "c_look_tone",
+      "patch": {
+        "loss": {
+          "flat": 10,
+          "edge": 0.5,
+          "contrast": 1
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,25 @@
+[2026-10-10T01:17:32Z INFO  fpga_st_train::backend] backend vulkan (SPIR-V/CubeCL), device spec "d1" -> DiscreteGpu(1)
+[2026-10-10T01:17:32Z INFO  fpga_st_train::data::dataset] dataset: 18 pairs
+[2026-10-10T01:17:33Z INFO  wgpu_hal::vulkan::adapter] Found 6 cooperative matrix configurations supported by wgpu
+[2026-10-10T01:17:33Z INFO  cubecl_wgpu::runtime] Using adapter AdapterInfo { name: "Tesla T10x", vendor: 4318, device: 7735, device_type: DiscreteGpu, device_pci_bus_id: "0000:04:00.0", driver: "NVIDIA", driver_info: "580.178.04", backend: Vulkan, subgroup_min_size: 32, subgroup_max_size: 32, transient_saves_memory: false }
+[2026-10-10T01:17:33Z INFO  cubecl_wgpu::runtime] Created wgpu compute server on device Device { inner: Core(CoreDevice { context: ContextWgpuCore { type: "Native" }, id: Id(0,1), error_sink: Mutex { data: ErrorSink }, features: Features { features_wgpu: FeaturesWGPU(SHADER_FLOAT32_ATOMIC | TEXTURE_FORMAT_16BIT_NORM | TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES | PIPELINE_STATISTICS_QUERY | TIMESTAMP_QUERY_INSIDE_ENCODERS | TIMESTAMP_QUERY_INSIDE_PASSES | TEXTURE_BINDING_ARRAY | BUFFER_BINDING_ARRAY | STORAGE_RESOURCE_BINDING_ARRAY | SAMPLED_TEXTURE_AND_STORAGE_BUFFER_ARRAY_NON_UNIFORM_INDEXING | STORAGE_TEXTURE_ARRAY_NON_UNIFORM_INDEXING | PARTIALLY_BOUND_BINDING_ARRAY | MULTI_DRAW_INDIRECT_COUNT | ADDRESS_MODE_CLAMP_TO_ZERO | ADDRESS_MODE_CLAMP_TO_BORDER | POLYGON_MODE_LINE | POLYGON_MODE_POINT | CONSERVATIVE_RASTERIZATION | VERTEX_WRITABLE_STORAGE | CLEAR_TEXTURE | MULTIVIEW | TEXTURE_ATOMIC | TEXTURE_FORMAT_NV12 | TEXTURE_FORMAT_P010 | EXPERIMENTAL_RAY_QUERY | SHADER_F64 | SHADER_I16 | SHADER_EARLY_DEPTH_TEST | SHADER_INT64 | SUBGROUP | SUBGROUP_VERTEX | SUBGROUP_BARRIER | PIPELINE_CACHE | SHADER_INT64_ATOMIC_MIN_MAX | SHADER_INT64_ATOMIC_ALL_OPS | TEXTURE_INT64_ATOMIC | EXPERIMENTAL_MESH_SHADER | EXPERIMENTAL_RAY_HIT_VERTEX_RETURN | EXPERIMENTAL_MESH_SHADER_MULTIVIEW | EXTENDED_ACCELERATION_STRUCTURE_VERTEX_FORMATS | PASSTHROUGH_SHADERS | SHADER_BARYCENTRICS | SELECTIVE_MULTIVIEW | EXPERIMENTAL_MESH_SHADER_POINTS | MULTISAMPLE_ARRAY | EXPERIMENTAL_COOPERATIVE_MATRIX | SHADER_PER_VERTEX | SHADER_DRAW_INDEX | ACCELERATION_STRUCTURE_BINDING_ARRAY | MEMORY_DECORATION_COHERENT | MEMORY_DECORATION_VOLATILE), features_webgpu: FeaturesWebGPU(DEPTH_CLIP_CONTROL | DEPTH32FLOAT_STENCIL8 | TEXTURE_COMPRESSION_BC | TEXTURE_COMPRESSION_BC_SLICED_3D | TIMESTAMP_QUERY | INDIRECT_FIRST_INSTANCE | SHADER_F16 | RG11B10UFLOAT_RENDERABLE | BGRA8UNORM_STORAGE | FLOAT32_FILTERABLE | FLOAT32_BLENDABLE | DUAL_SOURCE_BLENDING | CLIP_DISTANCES | IMMEDIATES | PRIMITIVE_INDEX) } }) } => AdapterInfo { name: "Tesla T10x", vendor: 4318, device: 7735, device_type: DiscreteGpu, device_pci_bus_id: "0000:04:00.0", driver: "NVIDIA", driver_info: "580.178.04", backend: Vulkan, subgroup_min_size: 32, subgroup_max_size: 32, transient_saves_memory: false }
+[2026-10-10T01:17:33Z INFO  fpga_st_train::train] student: WgpuRuntime, f32, i32, u8>>>> (51635 parameters)
+training 'bench_t10_pcie' for 40 steps: batch 4, crop 128, device d1, loss = 1*L1 + 0*gradL1 + 0*stroke + 0*TV
+[2026-10-10T01:17:33Z INFO  cubecl_runtime::tune::tune_cache] Load autotune cache ...
+[2026-10-10T01:17:33Z INFO  cubecl_runtime::tune::tune_cache] Loaded 117 autotune cached entries
+[2026-10-10T01:17:33Z INFO  cubecl_runtime::tune::tune_cache] Load autotune cache ...
+[2026-10-10T01:17:33Z INFO  cubecl_runtime::tune::tune_cache] Loaded 49 autotune cached entries
+[2026-10-10T01:17:37Z INFO  cubecl_runtime::tune::tune_cache] Load autotune cache ...
+[2026-10-10T01:17:37Z INFO  cubecl_runtime::tune::tune_cache] Loaded 23 autotune cached entries
+[2026-10-10T01:17:37Z INFO  cubecl_runtime::tune::tune_cache] Load autotune cache ...
+[2026-10-10T01:17:37Z INFO  cubecl_runtime::tune::tune_cache] Loaded 22 autotune cached entries
+[2026-10-10T01:17:37Z INFO  cubecl_runtime::tune::tune_cache] Load autotune cache ...
+[2026-10-10T01:17:37Z INFO  cubecl_runtime::tune::tune_cache] Loaded 20 autotune cached entries
+[2026-10-10T01:17:37Z INFO  cubecl_runtime::tune::tune_cache] Load autotune cache ...
+[2026-10-10T01:17:37Z INFO  cubecl_runtime::tune::tune_cache] Loaded 25 autotune cached entries
+step      10/40      loss   0.46305  l1 0.46305  grad 0.00000  stroke 0.00000  feat 0.00000  tv 0.00000  lr 6.000e-4  1.06 step/s  9.4 s
+step      20/40      loss   0.39098  l1 0.39098  grad 0.00000  stroke 0.00000  feat 0.00000  tv 0.00000  lr 6.000e-4  1.47 step/s  13.6 s
+step      30/40      loss   0.45459  l1 0.45459  grad 0.00000  stroke 0.00000  feat 0.00000  tv 0.00000  lr 6.000e-4  1.68 step/s  17.8 s
+step      40/40      loss   0.47024  l1 0.47024  grad 0.00000  stroke 0.00000  feat 0.00000  tv 0.00000  lr 6.000e-4  1.81 step/s  22.1 s
+done in 22.1 s -> /tmp/st_bench_t10_out/model.mpk
+WALL 23.02 sec

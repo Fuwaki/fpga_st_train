@@ -1,0 +1,45 @@
+{
+  "id": "tiny_dw_vangogh_film",
+  "base_config": "configs/dw_plugin_base.json",
+  "trials": [
+    {
+      "id": "film_half",
+      "patch": {
+        "student": {
+          "options": {
+            "res_blocks": 1,
+            "plugin": "in",
+            "plugin_site": "h4",
+            "color": "film_half"
+          }
+        }
+      }
+    },
+    {
+      "id": "film_full",
+      "patch": {
+        "student": {
+          "options": {
+            "res_blocks": 1,
+            "plugin": "in",
+            "plugin_site": "h4",
+            "color": "film_full"
+          }
+        }
+      }
+    },
+    {
+      "id": "film_both",
+      "patch": {
+        "student": {
+          "options": {
+            "res_blocks": 1,
+            "plugin": "in",
+            "plugin_site": "h4",
+            "color": "film_both"
+          }
+        }
+      }
+    }
+  ]
+}

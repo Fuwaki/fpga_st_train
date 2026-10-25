@@ -1,0 +1,77 @@
+{
+  "run": {
+    "name": "a_base",
+    "output_dir": "../trials/a_base",
+    "seed": 0,
+    "device": "d0",
+    "log_every": 100,
+    "val_every": 0,
+    "val_batch_size": 8,
+    "checkpoint_every": 1000,
+    "sample_every": 250,
+    "sample_limit": 6,
+    "sample_content": "../../../../style-transfer/demo_inputs",
+    "sample_size": 384
+  },
+  "data": {
+    "content_dir": "../../../../style-transfer/demo_inputs",
+    "hf": {
+      "repo": "detection-datasets/coco",
+      "split": "train",
+      "max_shards": 10
+    },
+    "pseudo_gt_dir": null,
+    "crop": 192,
+    "batch_size": 32,
+    "limit": null
+  },
+  "teacher": {
+    "kind": "whitebox",
+    "model": "../../../../teachers/whitebox/cartoonizer.onnx",
+    "enabled": true
+  },
+  "loss": {
+    "pixel": 1,
+    "gradient": 2,
+    "flat": 0,
+    "edge": 0,
+    "contrast": 0,
+    "stroke": 0,
+    "texture": 0,
+    "feature": 0,
+    "tv": 0,
+    "perceptual": 0,
+    "style": 0,
+    "vgg_weights": null
+  },
+  "optim": {
+    "learning_rate": 0.0006,
+    "beta_1": 0.9,
+    "beta_2": 0.999,
+    "epsilon": 1e-05,
+    "iterations": 500,
+    "schedule": {
+      "kind": "linear",
+      "final_lr": 6e-05,
+      "num_iters": 500
+    },
+    "grad_clip": null
+  },
+  "student": {
+    "arch": "tiny_dw_guided",
+    "options": {
+      "base": 32,
+      "trunk": 64,
+      "res_blocks": 1,
+      "up_h4": 32,
+      "up_h2": 48,
+      "guide": 8,
+      "full": 0,
+      "film_h2": 1,
+      "film_full": 0,
+      "trunk_at": "h4",
+      "h2_guide": 16,
+      "in_eps": 1e-08
+    }
+  }
+}

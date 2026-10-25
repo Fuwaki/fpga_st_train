@@ -1,0 +1,42 @@
+{
+  "id": "tiny_dw_vangogh_trunk",
+  "base_config": "configs/dw_plugin_base.json",
+  "trials": [
+    {
+      "id": "in_rb0",
+      "patch": {
+        "student": {
+          "options": {
+            "res_blocks": 0,
+            "plugin": "in",
+            "plugin_site": "h4"
+          }
+        }
+      }
+    },
+    {
+      "id": "in_rb1",
+      "patch": {
+        "student": {
+          "options": {
+            "res_blocks": 1,
+            "plugin": "in",
+            "plugin_site": "h4"
+          }
+        }
+      }
+    },
+    {
+      "id": "narrow_in",
+      "patch": {
+        "student": {
+          "options": {
+            "res_blocks": 0,
+            "plugin": "narrow_in",
+            "plugin_site": "h4"
+          }
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,38 @@
+{
+  "id": "tiny_dw_vangogh_overfit_trunk",
+  "base_config": "experiments/tiny_dw_vangogh_overfit/configs/v2.json",
+  "trials": [
+    {
+      "id": "b1_h4",
+      "patch": {
+        "optim": { "iterations": 1000 },
+        "student": { "options": { "trunk_at": "h4", "h2_guide": 16 } }
+      }
+    },
+    {
+      "id": "b2_h8",
+      "patch": {
+        "optim": { "iterations": 1000 },
+        "student": {
+          "arch": "tiny_dw",
+          "options": {
+            "res_blocks": 1,
+            "mid": 48,
+            "fine": 24,
+            "plugin": "in",
+            "plugin_site": "h4",
+            "color": "film_both",
+            "trunk_at": "h8"
+          }
+        }
+      }
+    },
+    {
+      "id": "b3_resid",
+      "patch": {
+        "optim": { "iterations": 1000 },
+        "student": { "options": { "guide_mix": "resid" } }
+      }
+    }
+  ]
+}
