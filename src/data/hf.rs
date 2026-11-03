@@ -11,12 +11,15 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 use anyhow::{Context, Result, bail};
 use arrow::array::{Array, BinaryArray, StructArray};
 use arrow::record_batch::RecordBatch;
-use hf_hub::{Repo, RepoType, api::sync::Api};
+use hf_hub::{
+    Repo, RepoType,
+    api::sync::{Api, ApiBuilder},
+};
 use image::RgbImage;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::file::reader::FileReader;
@@ -33,6 +36,8 @@ pub struct HfContentDataset {
     shard_paths: Vec<String>,
     len: usize,
     index: OnceLock<ShardIndex>,
+    /// `hf-hub` takes a non-blocking file lock, so only one thread may build the index.
+    index_gate: Mutex<()>,
 }
 
 struct ShardIndex {
@@ -55,7 +60,10 @@ struct IndexedShard {
 
 impl HfContentDataset {
     pub fn open(cfg: &HfDataConfig, limit: Option<usize>) -> Result<Self> {
-        let api = Api::new().context("hf-hub Api::new")?;
+        // `from_env` reads `HF_ENDPOINT`, so a mirror can serve the dataset listing.
+        let api = ApiBuilder::from_env()
+            .build()
+            .context("hf-hub ApiBuilder::from_env")?;
         let repo_id = cfg.repo.clone();
         let revision = cfg.revision.clone();
         let prefix = format!("data/{}-", cfg.split);
@@ -111,19 +119,34 @@ impl HfContentDataset {
                         full
                     }
                 }
-                Err(err) => {
-                    log::warn!(
-                        "datasets-server /size failed ({err:#}); counting rows in the cached shards"
-                    );
-                    count_local_rows(&repo_id, &revision, &shard_paths)?
-                }
+                Err(err) => match count_local_rows(&repo_id, &revision, &shard_paths) {
+                    Ok(rows) => {
+                        log::warn!(
+                            "datasets-server /size failed ({err:#}); counted {rows} rows in the cached shards"
+                        );
+                        rows
+                    }
+                    Err(count_err) => {
+                        log::warn!(
+                            "datasets-server /size failed ({err:#}); cached row count unavailable ({count_err:#}); the index will use every downloaded row"
+                        );
+                        usize::MAX
+                    }
+                },
             }
         };
         let len = limit.map(|n| n.min(subset_rows)).unwrap_or(subset_rows);
-        log::info!(
-            "hf-hub dataset {repo_id} split={}: {len} images (~{subset_rows} from {shard_count}/{shard_count_all} shards; index {shard_count} shards on first sample)",
-            cfg.split,
-        );
+        if subset_rows == usize::MAX {
+            log::info!(
+                "hf-hub dataset {repo_id} split={}: row count unknown until the first sample indexes {shard_count}/{shard_count_all} shards",
+                cfg.split,
+            );
+        } else {
+            log::info!(
+                "hf-hub dataset {repo_id} split={}: {len} images (~{subset_rows} from {shard_count}/{shard_count_all} shards; index {shard_count} shards on first sample)",
+                cfg.split,
+            );
+        }
 
         Ok(Self {
             api,
@@ -132,6 +155,7 @@ impl HfContentDataset {
             shard_paths,
             len,
             index: OnceLock::new(),
+            index_gate: Mutex::new(()),
         })
     }
 
@@ -139,8 +163,8 @@ impl HfContentDataset {
         self.len
     }
 
-    pub fn sample_cropped(&self, crop: u32, rng: &mut impl Rng) -> Result<RgbImage> {
-        let index = OnceLockExt::get_or_try_init(&self.index, || self.build_index())?;
+    pub fn sample_cropped(&self, width: u32, height: u32, rng: &mut impl Rng) -> Result<RgbImage> {
+        let index = self.shared_index()?;
         let effective = index.total_rows().min(self.len);
         if effective == 0 {
             bail!("hf dataset has no rows after indexing");
@@ -156,7 +180,27 @@ impl HfContentDataset {
         let img = image::load_from_memory(&bytes)
             .context("decode jpeg from hf parquet")?
             .to_rgb8();
-        Ok(random_crop(&img, crop, rng))
+        Ok(if width == height {
+            random_crop(&img, width, rng)
+        } else {
+            super::dataset::random_window(&img, width, height, rng)
+        })
+    }
+
+    fn shared_index(&self) -> Result<&ShardIndex> {
+        if let Some(index) = self.index.get() {
+            return Ok(index);
+        }
+        let _gate = self
+            .index_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(index) = self.index.get() {
+            return Ok(index);
+        }
+        let built = self.build_index()?;
+        let _ = self.index.set(built);
+        self.index.get().context("hf index was just stored")
     }
 
     fn build_index(&self) -> Result<ShardIndex> {
@@ -424,24 +468,4 @@ fn image_bytes_from_batch(batch: &RecordBatch, row: usize) -> Result<Vec<u8>> {
             .map(|f| f.name().clone())
             .collect::<Vec<_>>()
     );
-}
-
-trait OnceLockExt<T> {
-    fn get_or_try_init<F>(&self, f: F) -> Result<&T>
-    where
-        F: FnOnce() -> Result<T>;
-}
-
-impl<T> OnceLockExt<T> for OnceLock<T> {
-    fn get_or_try_init<F>(&self, f: F) -> Result<&T>
-    where
-        F: FnOnce() -> Result<T>,
-    {
-        if let Some(v) = self.get() {
-            return Ok(v);
-        }
-        let v = f()?;
-        let _ = self.set(v);
-        Ok(self.get().expect("just set"))
-    }
 }

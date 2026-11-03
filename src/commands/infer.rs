@@ -17,5 +17,6 @@ pub fn run(args: InferArgs, device_spec: &str) -> Result<()> {
         &args.out,
         args.size,
         &args.ext,
+        args.style,
     )
 }

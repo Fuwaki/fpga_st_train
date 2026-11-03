@@ -86,13 +86,32 @@ pub enum ExportStep<'a> {
         out_scale: f32,
         post_relu: bool,
     },
-    /// Spatial InstanceNorm + γ, β on one quantised point (in-place).
+    /// InstanceNorm over H×W, then γ, β. `in_point == out_point` is in-place.
     InstanceNorm {
         name: String,
-        point: usize,
+        in_point: usize,
+        out_point: usize,
         channels: usize,
         gamma: Vec<f32>,
         beta: Vec<f32>,
+        eps: f32,
+        out_scale: f32,
+    },
+    /// LayerNorm over channels at each pixel, then γ, β.
+    LayerNorm {
+        name: String,
+        in_point: usize,
+        out_point: usize,
+        channels: usize,
+        gamma: Vec<f32>,
+        beta: Vec<f32>,
+        eps: f32,
+        out_scale: f32,
+    },
+    /// 2×2 average pool. The stem reads this; the full-resolution guide keeps `in_point`.
+    AvgPool2x {
+        in_point: usize,
+        out_point: usize,
         out_scale: f32,
     },
     /// Global-pool FiLM replacing a same-width 1×1 colour slot.
@@ -188,7 +207,7 @@ fn read_bias(bias: Option<&burn::module::Param<Tensor<InferBackend, 1>>>) -> Res
     }
 }
 
-fn default_notes(bits: &Bits) -> Vec<String> {
+pub(crate) fn default_notes(bits: &Bits) -> Vec<String> {
     vec![
         format!(
             "activations: symmetric int{}, one scale per tensor, zero point 0",
@@ -459,10 +478,12 @@ impl Exportable for TinyDwStudent<InferBackend> {
                 .expect("instance norm γ/β");
             plan.push(ExportStep::InstanceNorm {
                 name: "plugin.in_h4".into(),
-                point: dec_base,
+                in_point: dec_base,
+                out_point: dec_base,
                 channels: gamma.len(),
                 gamma,
                 beta,
+                eps: INSTANCE_NORM_EPS,
                 out_scale: scales[dec_base],
             });
         }
@@ -615,6 +636,39 @@ impl Int8Exporter {
 }
 
 const INSTANCE_NORM_EPS: f32 = 1e-5;
+
+fn push_norm(
+    norm_layers: &mut Vec<InstanceNormLayer>,
+    graph: &mut Vec<QuantOp>,
+    op: &str,
+    name: &str,
+    in_point: usize,
+    out_point: usize,
+    channels: usize,
+    gamma: &[f32],
+    beta: &[f32],
+    eps: f32,
+    in_scale: f32,
+    out_scale: f32,
+) {
+    norm_layers.push(InstanceNormLayer {
+        name: name.to_owned(),
+        point: out_point,
+        channels,
+        in_scale,
+        out_scale,
+        eps,
+        gamma: gamma.to_vec(),
+        beta: beta.to_vec(),
+    });
+    graph.push(QuantOp {
+        op: op.to_owned(),
+        layer: Some(name.to_owned()),
+        point: Some(out_point),
+        source_point: Some(in_point),
+        scale: Some(out_scale),
+    });
+}
 
 fn export_film_head(pw: &PwConv<InferBackend>, in_scale: f32, qmax: f32) -> Result<FilmHead> {
     let [out_ch, in_ch, _, _] = pw.weight().dims();
@@ -811,27 +865,64 @@ pub fn export_int8<M: Exportable>(
             }
             ExportStep::InstanceNorm {
                 name,
-                point,
+                in_point,
+                out_point,
                 channels,
                 gamma,
                 beta,
+                eps,
                 out_scale,
             } => {
-                norm_layers.push(InstanceNormLayer {
-                    name: name.clone(),
-                    point: *point,
-                    channels: *channels,
-                    in_scale: calibration.scales[*point],
-                    out_scale: *out_scale,
-                    eps: INSTANCE_NORM_EPS,
-                    gamma: gamma.clone(),
-                    beta: beta.clone(),
-                });
+                push_norm(
+                    &mut norm_layers,
+                    &mut graph,
+                    "instance_norm",
+                    name,
+                    *in_point,
+                    *out_point,
+                    *channels,
+                    gamma,
+                    beta,
+                    *eps,
+                    calibration.scales[*in_point],
+                    *out_scale,
+                );
+            }
+            ExportStep::LayerNorm {
+                name,
+                in_point,
+                out_point,
+                channels,
+                gamma,
+                beta,
+                eps,
+                out_scale,
+            } => {
+                push_norm(
+                    &mut norm_layers,
+                    &mut graph,
+                    "layer_norm",
+                    name,
+                    *in_point,
+                    *out_point,
+                    *channels,
+                    gamma,
+                    beta,
+                    *eps,
+                    calibration.scales[*in_point],
+                    *out_scale,
+                );
+            }
+            ExportStep::AvgPool2x {
+                in_point,
+                out_point,
+                out_scale,
+            } => {
                 graph.push(QuantOp {
-                    op: "instance_norm".to_owned(),
-                    layer: Some(name.clone()),
-                    point: Some(*point),
-                    source_point: None,
+                    op: "avg_pool2x".to_owned(),
+                    layer: None,
+                    point: Some(*out_point),
+                    source_point: Some(*in_point),
                     scale: Some(*out_scale),
                 });
             }

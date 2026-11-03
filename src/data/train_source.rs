@@ -62,12 +62,13 @@ impl TrainContentSource {
     /// Content crop and optional on-disk pseudo-GT crop (HF uses online teacher only).
     pub fn sample_crops(
         &self,
-        crop: u32,
+        width: u32,
+        height: u32,
         rng: &mut impl Rng,
     ) -> Result<(RgbImage, Option<RgbImage>)> {
         match self {
-            Self::Disk(d) => load_pair_cropped(d.sample(rng), crop, rng),
-            Self::Hf(h) => Ok((h.sample_cropped(crop, rng)?, None)),
+            Self::Disk(d) => load_pair_cropped(d.sample(rng), width, height, rng),
+            Self::Hf(h) => Ok((h.sample_cropped(width, height, rng)?, None)),
             Self::Overfit { content, target } => Ok((content.clone(), target.clone())),
         }
     }

@@ -26,6 +26,12 @@ pub enum Command {
     InitConfig(InitConfigArgs),
     /// Train the student.
     Train(TrainArgs),
+    /// Copy a guided checkpoint into a narrower student, keeping the strongest channels.
+    Prune(PruneArgs),
+    /// Fold a 3-plane guided checkpoint onto luma plus the 135° chroma axis.
+    FoldYc(FoldYcArgs),
+    /// Duplicate the trunk norm and H/2 FiLM into one packet per style.
+    PackStyles(PackStylesArgs),
     /// Run a delivered model directory over content images (the deployment entry point).
     Infer(InferArgs),
     /// Measure the activation ranges needed for int8 quantisation.
@@ -94,6 +100,72 @@ pub struct TrainArgs {
 }
 
 #[derive(Args, Debug)]
+pub struct PruneArgs {
+    /// Directory with `model.json` and `model.mpk` from a trained guided student.
+    #[arg(long)]
+    pub from: PathBuf,
+    /// Checkpoint inside `--from`. Defaults to `model.mpk`.
+    #[arg(long)]
+    pub checkpoint: Option<PathBuf>,
+    /// Where to write the narrow `model.mpk`, `model.json`, and `prune.json`.
+    #[arg(long)]
+    pub out: PathBuf,
+    /// Images used to rank channels. Defaults to `content_*.png` in `--from`.
+    #[arg(long)]
+    pub content: Option<PathBuf>,
+    /// Reflect-pad content up to this width before scoring. 640 is the deployment frame.
+    #[arg(long, default_value_t = 640)]
+    pub width: usize,
+    /// Reflect-pad content up to this height before scoring.
+    #[arg(long, default_value_t = 480)]
+    pub height: usize,
+    #[arg(long, default_value_t = 16)]
+    pub base: usize,
+    #[arg(long, default_value_t = 80)]
+    pub trunk: usize,
+    #[arg(long, default_value_t = 24)]
+    pub up_h4: usize,
+    #[arg(long, default_value_t = 40)]
+    pub up_h2: usize,
+    #[arg(long, default_value_t = 10)]
+    pub h2_guide: usize,
+    #[arg(long, default_value_t = 8)]
+    pub guide: usize,
+    /// Residual blocks to keep. `0` drops the block and copies every other slice.
+    #[arg(long, default_value_t = 1)]
+    pub res_blocks: usize,
+}
+
+#[derive(Args, Debug)]
+pub struct FoldYcArgs {
+    /// Directory with `model.json` and `model.mpk` from a 3-plane guided student.
+    #[arg(long)]
+    pub from: PathBuf,
+    /// Checkpoint inside `--from`. Defaults to `model.mpk`.
+    #[arg(long)]
+    pub checkpoint: Option<PathBuf>,
+    /// Where to write the 2-plane `model.mpk` and `model.json`.
+    #[arg(long)]
+    pub out: PathBuf,
+}
+
+#[derive(Args, Debug)]
+pub struct PackStylesArgs {
+    /// Directory with `model.json` and `model.mpk` from a one-style guided student.
+    #[arg(long)]
+    pub from: PathBuf,
+    /// Checkpoint inside `--from`. Defaults to `model.mpk`.
+    #[arg(long)]
+    pub checkpoint: Option<PathBuf>,
+    /// Where to write the multi-style `model.mpk` and `model.json`.
+    #[arg(long)]
+    pub out: PathBuf,
+    /// Style slots. Style 0 keeps the loaded packet; the rest are copies of it.
+    #[arg(long, default_value_t = 2)]
+    pub styles: usize,
+}
+
+#[derive(Args, Debug)]
 pub struct InferArgs {
     #[arg(long)]
     pub model: PathBuf,
@@ -109,6 +181,9 @@ pub struct InferArgs {
     pub size: u32,
     #[arg(long, default_value = "png")]
     pub ext: String,
+    /// Style packet. `0` is the trunk norm and H/2 FiLM stored in the original fields.
+    #[arg(long, default_value_t = 0)]
+    pub style: usize,
 }
 
 #[derive(Args, Debug)]
@@ -121,6 +196,10 @@ pub struct CalibrateArgs {
     pub checkpoint: Option<PathBuf>,
     #[arg(long, default_value_t = 192)]
     pub crop: usize,
+    #[arg(long)]
+    pub frame_width: Option<usize>,
+    #[arg(long)]
+    pub frame_height: Option<usize>,
     #[arg(long, default_value_t = 4)]
     pub batch_size: usize,
     #[arg(long, default_value_t = 20)]

@@ -1,0 +1,23 @@
+{
+  "id": "tiny_dw_whitebox_480p_prune90",
+  "base_config": "experiments/tiny_dw_whitebox_480p_prune90/base.json",
+  "trials": [
+    {
+      "id": "ln",
+      "patch": {}
+    },
+    {
+      "id": "in",
+      "patch": {
+        "run": {
+          "init_from": "init/in/model.mpk"
+        },
+        "student": {
+          "options": {
+            "trunk_norm_kind": "in"
+          }
+        }
+      }
+    }
+  ]
+}

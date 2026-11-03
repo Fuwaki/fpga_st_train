@@ -1,0 +1,26 @@
+{
+  "arch": "tiny_dw_guided",
+  "options": {
+    "base": 16,
+    "film_full": 0,
+    "film_h2": 1,
+    "full": 0,
+    "guide": 4,
+    "h2_guide": 5,
+    "in_eps": 0.00001,
+    "pre_in_gain": "sqrt2",
+    "res_blocks": 1,
+    "trunk": 32,
+    "trunk_at": "h4",
+    "trunk_norm_kind": "ln",
+    "up_h2": 20,
+    "up_h4": 12
+  },
+  "meta": {
+    "iterations": 12000,
+    "pruned_from": "experiments/tiny_dw_whitebox_480p/trials/ln/model.mpk",
+    "run": "ln",
+    "source_params": 45183,
+    "style": "experiments/tiny_dw_whitebox_480p/configs/../../../../teachers/whitebox/cartoonizer.onnx"
+  }
+}

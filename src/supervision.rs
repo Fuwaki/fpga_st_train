@@ -17,6 +17,19 @@ use crate::{InferBackend, TrainBackend};
 /// Optional online teacher; pseudo-GT comes from the dataset batch.
 pub struct Supervision {
     teacher: Option<LiveTeacher>,
+    /// Style-packet teachers, in student style order. Empty for a one-teacher run.
+    packets: Vec<PacketTeacher>,
+}
+
+struct PacketTeacher {
+    name: String,
+    teacher: OnnxTeacher,
+}
+
+/// One style a sample image should be compared against.
+pub struct StyleView<'a> {
+    pub name: &'a str,
+    pub teacher: &'a dyn DistillTeacher,
 }
 
 enum LiveTeacher {
@@ -28,15 +41,94 @@ enum LiveTeacher {
 impl Supervision {
     /// Build supervision from run config (loads the configured teacher when enabled).
     pub fn try_from_config(config: &Config, device: &TrainDevice) -> Result<Self> {
+        if !config.teacher.styles.is_empty() {
+            let started = Instant::now();
+            let mut packets = Vec::with_capacity(config.teacher.styles.len());
+            for style in &config.teacher.styles {
+                let kind = TeacherKind::parse(&style.kind)?;
+                packets.push(PacketTeacher {
+                    name: style.name.clone(),
+                    teacher: OnnxTeacher::open(kind, &style.model)
+                        .with_context(|| format!("style '{}'", style.name))?,
+                });
+            }
+            log::info!(
+                "{} style teachers loaded in {:.2} s",
+                packets.len(),
+                started.elapsed().as_secs_f32()
+            );
+            return Ok(Self {
+                teacher: None,
+                packets,
+            });
+        }
         let teacher = if config.teacher.enabled {
             Some(load_teacher(config, device)?)
         } else {
             None
         };
-        Ok(Self { teacher })
+        Ok(Self {
+            teacher,
+            packets: Vec::new(),
+        })
+    }
+
+    /// More than one style packet shares the step.
+    pub fn is_multi(&self) -> bool {
+        self.packets.len() > 1
+    }
+
+    pub fn n_styles(&self) -> usize {
+        if self.packets.is_empty() {
+            1
+        } else {
+            self.packets.len()
+        }
+    }
+
+    pub fn style_name(&self, index: usize) -> &str {
+        self.packets
+            .get(index)
+            .map(|packet| packet.name.as_str())
+            .unwrap_or("")
+    }
+
+    /// Teachers for sample images. A one-teacher run is a single unnamed entry.
+    pub fn sample_styles(&self) -> Vec<StyleView<'_>> {
+        if !self.packets.is_empty() {
+            return self
+                .packets
+                .iter()
+                .map(|packet| StyleView {
+                    name: packet.name.as_str(),
+                    teacher: &packet.teacher,
+                })
+                .collect();
+        }
+        match self.teacher() {
+            Some(teacher) => vec![StyleView { name: "", teacher }],
+            None => Vec::new(),
+        }
+    }
+
+    /// Run one packet teacher. Content is RGB `[0, 1]`; the student quantises itself.
+    pub fn stylize_style(
+        &self,
+        index: usize,
+        content: Tensor<TrainBackend, 4>,
+    ) -> Result<Tensor<TrainBackend, 4>> {
+        let packet = self
+            .packets
+            .get(index)
+            .with_context(|| format!("style index {index} is outside the teacher list"))?;
+        let out = packet.teacher.stylize(content.inner())?;
+        Ok(Tensor::<TrainBackend, 4>::from_inner(out))
     }
 
     pub fn teacher(&self) -> Option<&dyn DistillTeacher> {
+        if let Some(packet) = self.packets.first() {
+            return Some(&packet.teacher);
+        }
         match &self.teacher {
             Some(LiveTeacher::Onnx(teacher)) => Some(teacher),
             Some(LiveTeacher::Device(teacher)) => Some(teacher.as_ref()),
@@ -45,8 +137,14 @@ impl Supervision {
     }
 
     /// WhiteBox and rain-princess run off the training GPU, so the next batch
-    /// can be queued behind the student backward.
+    /// can be queued behind the student backward. Several styles run in order.
     pub fn pipelines_on_host(&self) -> bool {
+        if self.packets.len() > 1 {
+            return false;
+        }
+        if self.packets.len() == 1 {
+            return true;
+        }
         matches!(self.teacher, Some(LiveTeacher::Onnx(_)))
     }
 
@@ -125,7 +223,7 @@ fn load_teacher(config: &Config, device: &TrainDevice) -> Result<LiveTeacher> {
             log::info!("style branch precomputed (fixed style, alpha fixed at 1.0)");
             LiveTeacher::Device(Box::new(Stylizer::new(model, style)))
         }
-        kind @ (TeacherKind::RainPrincess | TeacherKind::Whitebox) => {
+        kind @ (TeacherKind::RainPrincess | TeacherKind::Whitebox | TeacherKind::Fns) => {
             let model = config
                 .teacher
                 .model

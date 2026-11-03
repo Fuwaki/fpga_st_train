@@ -10,6 +10,7 @@ use rand::rngs::StdRng;
 
 use crate::TrainBackend;
 use crate::backend::TrainDevice;
+use crate::config::FrameSize;
 use crate::data::dataset::PairDataset;
 use crate::data::train_source::TrainContentSource;
 use crate::quant::{Bits, Calibration, Quantizable};
@@ -21,6 +22,7 @@ use crate::train::{build_batch, load_checkpoint};
 pub struct CalibrationJob {
     pub content_dir: PathBuf,
     pub crop: usize,
+    pub frame: Option<FrameSize>,
     pub batch_size: usize,
     pub seed: u64,
     pub batches: usize,
@@ -32,11 +34,31 @@ impl Default for CalibrationJob {
         Self {
             content_dir: PathBuf::from("data/content"),
             crop: 192,
+            frame: None,
             batch_size: 4,
             seed: 0,
             batches: 20,
             safety: 1.0,
         }
+    }
+}
+
+impl CalibrationJob {
+    fn frame_dimensions(&self) -> Result<(u32, u32)> {
+        let (width, height, alignment) = match self.frame {
+            Some(frame) => (frame.width, frame.height, 8),
+            None => (self.crop, self.crop, 4),
+        };
+        let width =
+            u32::try_from(width).map_err(|_| anyhow::anyhow!("calibration width is too large"))?;
+        let height = u32::try_from(height)
+            .map_err(|_| anyhow::anyhow!("calibration height is too large"))?;
+        if width == 0 || height == 0 || width % alignment != 0 || height % alignment != 0 {
+            anyhow::bail!(
+                "calibration dimensions must be positive multiples of {alignment}, got {width}x{height}"
+            );
+        }
+        Ok((width, height))
     }
 }
 
@@ -63,18 +85,20 @@ where
         bail!("this student has no quantised points (Quantizable::quant_points is empty)");
     }
     let model = model.valid();
+    let (width, height) = job.frame_dimensions()?;
     log::info!(
-        "calibrating {} quantised points for {} on {} batches of {}x{} crops",
+        "calibrating {} quantised points for {} on {} batches of {} samples at {}x{} frames",
         points.len(),
         bits.label(),
         job.batches,
         job.batch_size,
-        job.crop
+        width,
+        height
     );
 
     let mut absmax = vec![0.0f32; points.len()];
     for step in 1..=job.batches {
-        let batch = build_batch(&dataset, job.crop as u32, job.batch_size, &mut rng, device)?;
+        let batch = build_batch(&dataset, width, height, job.batch_size, &mut rng, device)?;
         model.observe_activations(batch.content.valid(), &mut |point, value| {
             if value > absmax[point] {
                 absmax[point] = value;
@@ -99,4 +123,57 @@ where
         batches: job.batches,
         bits,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn job(crop: usize, frame: Option<FrameSize>) -> CalibrationJob {
+        CalibrationJob {
+            content_dir: PathBuf::new(),
+            crop,
+            frame,
+            batch_size: 1,
+            seed: 0,
+            batches: 1,
+            safety: 1.0,
+        }
+    }
+
+    #[test]
+    fn uses_rectangular_calibration_frame() {
+        assert_eq!(
+            job(
+                192,
+                Some(FrameSize {
+                    width: 640,
+                    height: 480
+                })
+            )
+            .frame_dimensions()
+            .unwrap(),
+            (640, 480)
+        );
+    }
+
+    #[test]
+    fn defaults_to_square_calibration_crop() {
+        assert_eq!(job(192, None).frame_dimensions().unwrap(), (192, 192));
+    }
+
+    #[test]
+    fn rejects_misaligned_calibration_frame() {
+        assert!(
+            job(
+                192,
+                Some(FrameSize {
+                    width: 641,
+                    height: 480
+                })
+            )
+            .frame_dimensions()
+            .is_err()
+        );
+    }
 }

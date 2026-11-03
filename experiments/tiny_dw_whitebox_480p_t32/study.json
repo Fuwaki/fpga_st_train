@@ -1,0 +1,23 @@
+{
+  "id": "tiny_dw_whitebox_480p_t32",
+  "base_config": "experiments/tiny_dw_whitebox_480p_t32/base.json",
+  "trials": [
+    {
+      "id": "res",
+      "patch": {}
+    },
+    {
+      "id": "nores",
+      "patch": {
+        "run": {
+          "init_from": "init/nores/model.mpk"
+        },
+        "student": {
+          "options": {
+            "res_blocks": 0
+          }
+        }
+      }
+    }
+  ]
+}

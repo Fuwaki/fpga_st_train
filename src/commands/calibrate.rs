@@ -1,7 +1,7 @@
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 
 use fpga_st_train::backend::select_device;
-use fpga_st_train::config::ModelCard;
+use fpga_st_train::config::{FrameSize, ModelCard};
 use fpga_st_train::quant::CalibrationJob;
 use fpga_st_train::registry;
 
@@ -15,9 +15,15 @@ pub fn run(args: CalibrateArgs, device_spec: &str) -> Result<()> {
         .clone()
         .unwrap_or_else(|| args.model.join("model.mpk"));
     let device = select_device(device_spec);
+    let frame = match (args.frame_width, args.frame_height) {
+        (Some(width), Some(height)) => Some(FrameSize { width, height }),
+        (None, None) => None,
+        _ => bail!("--frame-width and --frame-height must be supplied together"),
+    };
     let job = CalibrationJob {
         content_dir: args.content.clone(),
         crop: args.crop,
+        frame,
         batch_size: args.batch_size,
         seed: args.seed,
         batches: args.batches,

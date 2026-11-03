@@ -1,11 +1,11 @@
 //! `arch = "tiny_dw_guided"` registration.
 //!
-//! Fp32 trial only. The graph is not in the integer export yet: calibration and
-//! `export-int8` fail on purpose so a checkpoint cannot be packaged by accident.
+//! The white-box line (H/4 trunk, H/2 FiLM, full-resolution guide, InstanceNorm or
+//! LayerNorm) calibrates and exports. Other guided topologies still fail export.
 
 use std::path::Path;
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use burn::prelude::*;
 
 use crate::TrainBackend;
@@ -29,7 +29,7 @@ fn build_train(
     device: &TrainDevice,
 ) -> Result<GuidedStudent<TrainBackend>> {
     let spec = GuideSpec::from_config(config).map_err(anyhow::Error::msg)?;
-    print_cost(spec);
+    print_cost(&spec);
     Ok(GuidedStudent::new(spec, device))
 }
 
@@ -42,23 +42,39 @@ pub fn train_cohort(configs: Vec<Config>, provenances: Vec<RunProvenance>) -> Re
 }
 
 pub fn calibrate(
-    _job: &CalibrationJob,
-    _card: &ModelCard,
-    _device: &TrainDevice,
-    _checkpoint: &Path,
-    _bits: crate::quant::Bits,
+    job: &CalibrationJob,
+    card: &ModelCard,
+    device: &TrainDevice,
+    checkpoint: &Path,
+    bits: crate::quant::Bits,
 ) -> Result<crate::quant::Calibration> {
-    bail!("tiny_dw_guided is an fp32 architecture trial; calibration is not implemented")
+    let student = card.student();
+    super::common::invoke_calibrate::<GuidedStudent<TrainBackend>, _>(
+        job,
+        ID,
+        |dev| Ok(build(&student, dev)),
+        device,
+        checkpoint,
+        bits,
+    )
 }
 
 pub fn export_int8(
-    _card: &ModelCard,
-    _checkpoint: &Path,
-    _calibration: &crate::quant::Calibration,
-    _out: &Path,
-    _device: &TrainDevice,
+    card: &ModelCard,
+    checkpoint: &Path,
+    calibration: &crate::quant::Calibration,
+    out: &Path,
+    device: &TrainDevice,
 ) -> Result<crate::quant::QuantManifest> {
-    bail!("tiny_dw_guided is an fp32 architecture trial; integer export is not implemented")
+    let student = card.student();
+    super::common::export_int8::<GuidedStudent<TrainBackend>, _>(
+        &student,
+        build,
+        checkpoint,
+        calibration,
+        out,
+        device,
+    )
 }
 
 pub fn load_fp32(

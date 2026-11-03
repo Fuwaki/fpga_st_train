@@ -39,18 +39,34 @@ impl Engine {
         }
     }
 
-    /// Stylise one content image.
-    pub fn run(&self, image: &image::RgbImage, device: &TrainDevice) -> Result<image::RgbImage> {
+    /// Stylise one content image. `style` selects a packet; fp32 is the only mode that has more than one.
+    pub fn run(
+        &self,
+        image: &image::RgbImage,
+        device: &TrainDevice,
+        style: usize,
+    ) -> Result<image::RgbImage> {
         match self {
             Engine::Fp32(model) => {
+                if style >= model.style_count() {
+                    bail!("style {style} is outside 0..{}", model.style_count());
+                }
                 let content = data::rgb_to_tensor::<crate::InferBackend>(image, device);
-                data::tensor_to_rgb(model.stylize(content))
+                data::tensor_to_rgb(model.stylize_style(content, style))
             }
             Engine::Sim(model, scheme) => {
+                if style != 0 {
+                    bail!("quantised simulation runs style 0");
+                }
                 let content = data::rgb_to_tensor::<crate::InferBackend>(image, device);
                 data::tensor_to_rgb(model.forward_quantised(content, scheme))
             }
-            Engine::Fixed(model) => model.forward_image(image),
+            Engine::Fixed(model) => {
+                if style != 0 {
+                    bail!("the integer reference runs style 0");
+                }
+                model.forward_image(image)
+            }
         }
     }
 }
@@ -124,10 +140,11 @@ pub fn stylise_contents(
     out: &Path,
     long_edge_max: u32,
     ext: &str,
+    style: usize,
 ) -> Result<()> {
     let contents = data::image_paths(content)?;
     std::fs::create_dir_all(out).with_context(|| format!("cannot create {}", out.display()))?;
-    log::info!("mode {mode}: {}", engine.describe());
+    log::info!("mode {mode}, style {style}: {}", engine.describe());
     log::info!("{} content image(s)", contents.len());
 
     let mut total = 0.0f32;
@@ -142,7 +159,7 @@ pub fn stylise_contents(
         let padded = data::pad_to_multiple(&img, 4);
 
         let step = Instant::now();
-        let output = engine.run(&padded, device)?;
+        let output = engine.run(&padded, device, style)?;
         let millis = step.elapsed().as_secs_f32() * 1e3;
         total += millis;
 

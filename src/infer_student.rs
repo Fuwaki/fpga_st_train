@@ -13,6 +13,17 @@ use crate::student::StudentModel;
 pub trait InferStudent {
     fn describe(&self) -> String;
     fn stylize(&self, content: Tensor<InferBackend, 4>) -> Tensor<InferBackend, 4>;
+    fn style_count(&self) -> usize {
+        1
+    }
+    fn stylize_style(
+        &self,
+        content: Tensor<InferBackend, 4>,
+        style: usize,
+    ) -> Tensor<InferBackend, 4> {
+        let _ = style;
+        self.stylize(content)
+    }
     fn forward_quantised(
         &self,
         content: Tensor<InferBackend, 4>,
@@ -27,6 +38,18 @@ impl<M: StudentModel<InferBackend> + Quantizable<InferBackend> + 'static> InferS
 
     fn stylize(&self, content: Tensor<InferBackend, 4>) -> Tensor<InferBackend, 4> {
         StudentModel::stylize(self, content)
+    }
+
+    fn style_count(&self) -> usize {
+        StudentModel::style_count(self)
+    }
+
+    fn stylize_style(
+        &self,
+        content: Tensor<InferBackend, 4>,
+        style: usize,
+    ) -> Tensor<InferBackend, 4> {
+        StudentModel::stylize_style(self, content, style)
     }
 
     fn forward_quantised(
@@ -56,6 +79,18 @@ impl InferStudent for StudentHandle {
 
     fn stylize(&self, content: Tensor<InferBackend, 4>) -> Tensor<InferBackend, 4> {
         self.0.stylize(content)
+    }
+
+    fn style_count(&self) -> usize {
+        self.0.style_count()
+    }
+
+    fn stylize_style(
+        &self,
+        content: Tensor<InferBackend, 4>,
+        style: usize,
+    ) -> Tensor<InferBackend, 4> {
+        self.0.stylize_style(content, style)
     }
 
     fn forward_quantised(

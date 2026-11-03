@@ -78,6 +78,9 @@ impl Config {
         if let Some(p) = self.teacher.model.as_mut() {
             fix(p);
         }
+        for style in &mut self.teacher.styles {
+            fix(&mut style.model);
+        }
         if let Some(p) = self.loss.vgg_weights.as_mut() {
             fix(p);
         }
@@ -112,6 +115,18 @@ impl Config {
             if self.data.hf.is_some() {
                 bail!("data.overfit_long_edge cannot be combined with data.hf");
             }
+        } else if let Some(frame) = self.data.frame {
+            if frame.width == 0
+                || frame.height == 0
+                || !frame.width.is_multiple_of(8)
+                || !frame.height.is_multiple_of(8)
+            {
+                bail!(
+                    "data.frame width and height must be positive multiples of 8, got {}x{}",
+                    frame.width,
+                    frame.height
+                );
+            }
         } else if self.data.crop == 0 || !self.data.crop.is_multiple_of(4) {
             bail!(
                 "data.crop must be a positive multiple of 4, got {}",
@@ -140,30 +155,72 @@ impl Config {
             bail!("every loss term is zero -- the model would learn nothing");
         }
         if self.teacher.enabled {
-            match self.teacher.kind()? {
-                TeacherKind::MicroAst => {
-                    let ckpt = self
-                        .teacher
-                        .weights_dir
-                        .join("content_encoder_iter_160000.pth.tar");
-                    if !ckpt.is_file() {
-                        let dir = display_path(&self.teacher.weights_dir);
-                        bail!(
-                            "MicroAST teacher weights not found at {dir}\n  \
-                             expected file: content_encoder_iter_160000.pth.tar (and three siblings)\n  \
-                             fix: put checkpoints there, or pass --teacher-weights / set TEACHER_WEIGHTS_DIR"
-                        );
+            if self.teacher.styles.is_empty() {
+                if self.student.usize_option("styles", 1) != 1 {
+                    bail!(
+                        "student styles = {} needs teacher.styles of the same length",
+                        self.student.usize_option("styles", 1)
+                    );
+                }
+                match self.teacher.kind()? {
+                    TeacherKind::MicroAst => {
+                        let ckpt = self
+                            .teacher
+                            .weights_dir
+                            .join("content_encoder_iter_160000.pth.tar");
+                        if !ckpt.is_file() {
+                            let dir = display_path(&self.teacher.weights_dir);
+                            bail!(
+                                "MicroAST teacher weights not found at {dir}\n  \
+                                 expected file: content_encoder_iter_160000.pth.tar (and three siblings)\n  \
+                                 fix: put checkpoints there, or pass --teacher-weights / set TEACHER_WEIGHTS_DIR"
+                            );
+                        }
+                    }
+                    TeacherKind::RainPrincess | TeacherKind::Whitebox | TeacherKind::Fns => {
+                        let Some(model) = &self.teacher.model else {
+                            bail!(
+                                "teacher.kind = {:?} requires teacher.model",
+                                self.teacher.kind
+                            );
+                        };
+                        if !model.is_file() {
+                            bail!("teacher model not found: {}", display_path(model));
+                        }
                     }
                 }
-                TeacherKind::RainPrincess | TeacherKind::Whitebox => {
-                    let Some(model) = &self.teacher.model else {
-                        bail!(
-                            "teacher.kind = {:?} requires teacher.model",
-                            self.teacher.kind
-                        );
-                    };
-                    if !model.is_file() {
-                        bail!("teacher model not found: {}", display_path(model));
+            } else {
+                if self.loss.feature > 0.0 {
+                    bail!("loss.feature is not defined across style packets");
+                }
+                if self.quant.enabled {
+                    bail!("QAT does not cover style packets");
+                }
+                let n = self.student.usize_option("styles", 1);
+                if n != self.teacher.styles.len() {
+                    bail!(
+                        "student styles = {n}, teacher.styles has {}",
+                        self.teacher.styles.len()
+                    );
+                }
+                let mut names = std::collections::BTreeSet::new();
+                for style in &self.teacher.styles {
+                    match TeacherKind::parse(&style.kind)? {
+                        TeacherKind::MicroAst => {
+                            bail!("style packet '{}' must be an ONNX teacher", style.name)
+                        }
+                        TeacherKind::RainPrincess | TeacherKind::Whitebox | TeacherKind::Fns => {
+                            if !style.model.is_file() {
+                                bail!(
+                                    "style '{}' model not found: {}",
+                                    style.name,
+                                    display_path(&style.model)
+                                );
+                            }
+                        }
+                    }
+                    if !names.insert(style.name.clone()) {
+                        bail!("duplicate style name '{}'", style.name);
                     }
                 }
             }
@@ -262,6 +319,13 @@ impl Default for HfDataConfig {
     }
 }
 
+/// Width and height of one training frame, in pixels.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct FrameSize {
+    pub width: usize,
+    pub height: usize,
+}
+
 /// Training data.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -273,9 +337,13 @@ pub struct DataConfig {
     /// Folder of teacher outputs. Files are matched to content by file stem.
     /// When absent the teacher is run online for every batch.
     pub pseudo_gt_dir: Option<PathBuf>,
-    /// Random crop size used for training. Must be a multiple of 4.
-    /// Ignored when `overfit_long_edge` is set.
+    /// Random square crop used for training. Must be a multiple of 4.
+    /// Ignored when `frame` or `overfit_long_edge` is set.
     pub crop: usize,
+    /// Random width×height frame. Both edges are multiples of 8. Images that do not
+    /// cover the frame are scaled up, aspect preserved, then cropped. This is the
+    /// 480p deployment size (`640×480`); a square `crop` cannot name it.
+    pub frame: Option<FrameSize>,
     /// Fit one content image, resized so its long edge is this value and both
     /// edges are multiples of 8. No random crop. `content_dir` is that image
     /// (or a folder containing only it). None keeps the normal crop pipeline.
@@ -292,9 +360,20 @@ impl Default for DataConfig {
             hf: None,
             pseudo_gt_dir: None,
             crop: 256,
+            frame: None,
             overfit_long_edge: None,
             batch_size: 4,
             limit: None,
+        }
+    }
+}
+
+impl DataConfig {
+    /// The random window drawn for each sample. `frame` wins over the square crop.
+    pub fn sample_frame(&self) -> (u32, u32) {
+        match self.frame {
+            Some(frame) => (frame.width as u32, frame.height as u32),
+            None => (self.crop as u32, self.crop as u32),
         }
     }
 }
@@ -308,6 +387,8 @@ pub enum TeacherKind {
     RainPrincess,
     /// White-box cartoonization ONNX. Needs `model`.
     Whitebox,
+    /// Fast Neural Style ONNX. Input and output are NCHW, scaled by 255 from `[0, 1]`.
+    Fns,
 }
 
 impl TeacherKind {
@@ -316,8 +397,11 @@ impl TeacherKind {
             "microast" => Ok(Self::MicroAst),
             "rain_princess" => Ok(Self::RainPrincess),
             "whitebox" => Ok(Self::Whitebox),
+            "fns" => Ok(Self::Fns),
             other => {
-                bail!("unknown teacher.kind {other:?}; expected microast, rain_princess, whitebox")
+                bail!(
+                    "unknown teacher.kind {other:?}; expected microast, rain_princess, whitebox, fns"
+                )
             }
         }
     }
@@ -327,8 +411,18 @@ impl TeacherKind {
             Self::MicroAst => "microast",
             Self::RainPrincess => "rain_princess",
             Self::Whitebox => "whitebox",
+            Self::Fns => "fns",
         }
     }
+}
+
+/// One teacher inside a style-packet run. Order is the student's style index.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StyleTeacher {
+    pub name: String,
+    /// `whitebox`, `rain_princess`, or `fns`.
+    pub kind: String,
+    pub model: PathBuf,
 }
 
 /// Online distillation teacher.
@@ -352,6 +446,8 @@ pub struct TeacherConfig {
     pub alpha: f32,
     /// Set false when training purely against pre-generated pseudo ground truth.
     pub enabled: bool,
+    /// When non-empty, one ONNX teacher per style packet, in student style order.
+    pub styles: Vec<StyleTeacher>,
 }
 
 impl TeacherConfig {
@@ -361,9 +457,17 @@ impl TeacherConfig {
 
     /// Label stored on the model card. MicroAST records the style image; ONNX records the file.
     pub fn style_label(&self) -> String {
+        if !self.styles.is_empty() {
+            return self
+                .styles
+                .iter()
+                .map(|style| format!("{}:{}", style.name, style.model.display()))
+                .collect::<Vec<_>>()
+                .join(", ");
+        }
         match self.kind().unwrap_or(TeacherKind::MicroAst) {
             TeacherKind::MicroAst => self.style.display().to_string(),
-            TeacherKind::RainPrincess | TeacherKind::Whitebox => self
+            TeacherKind::RainPrincess | TeacherKind::Whitebox | TeacherKind::Fns => self
                 .model
                 .as_ref()
                 .map(|p| p.display().to_string())
@@ -382,6 +486,7 @@ impl Default for TeacherConfig {
             style_size: 256,
             alpha: 1.0,
             enabled: false,
+            styles: Vec::new(),
         }
     }
 }

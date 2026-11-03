@@ -169,10 +169,16 @@ impl IntModel {
 
     fn run(&self, input: &[f32], height: usize, width: usize) -> Result<RunOut> {
         let m = &self.manifest;
-        if input.len() != 3 * height * width {
+        let channels = m
+            .layers
+            .iter()
+            .find(|layer| layer.name == "stem")
+            .map(|layer| layer.in_channels)
+            .unwrap_or(3);
+        if input.len() != channels * height * width {
             bail!(
                 "expected {} input values, got {}",
-                3 * height * width,
+                channels * height * width,
                 input.len()
             );
         }
@@ -201,12 +207,12 @@ impl IntModel {
         // The input image is quantised at point 0 with the calibrated scale.
         let s0 = m.point_scales[0];
         let qmax = m.act_qmax;
-        let mut data = vec![0i32; 3 * height * width];
+        let mut data = vec![0i32; channels * height * width];
         for (dst, src) in data.iter_mut().zip(input) {
             *dst = round_clamp(*src / s0, -qmax, qmax);
         }
         points[0] = Some(Act {
-            c: 3,
+            c: channels,
             h: height,
             w: width,
             data,
@@ -324,21 +330,47 @@ impl IntModel {
                     let out: Vec<f32> = codes.data.iter().map(|c| *c as f32 * scale).collect();
                     return Ok(RunOut::Image(out));
                 }
-                "instance_norm" => {
-                    let name = op.layer.as_deref().with_context(|| {
-                        format!("graph[{index}]: instance_norm without a layer")
-                    })?;
+                "instance_norm" | "layer_norm" => {
+                    let name = op
+                        .layer
+                        .as_deref()
+                        .with_context(|| format!("graph[{index}]: {} without a layer", op.op))?;
                     let spec = norm_by_name
                         .get(name)
                         .with_context(|| format!("graph[{index}]: unknown norm layer {name}"))?;
-                    let point = op.point.with_context(|| {
-                        format!("graph[{index}]: instance_norm without a point")
+                    let out_point = op
+                        .point
+                        .with_context(|| format!("graph[{index}]: {} without a point", op.op))?;
+                    let in_point = op.source_point.unwrap_or(out_point);
+                    let src = points
+                        .get(in_point)
+                        .and_then(|p| p.as_ref())
+                        .with_context(|| format!("graph[{index}]: point {in_point} is not live"))?;
+                    let normed = if op.op == "layer_norm" {
+                        layer_norm(spec, src, m.act_qmax)?
+                    } else {
+                        instance_norm(spec, src, m.act_qmax)?
+                    };
+                    points[out_point] = Some(normed);
+                }
+                "avg_pool2x" => {
+                    let out_point = op
+                        .point
+                        .with_context(|| format!("graph[{index}]: avg_pool2x without a point"))?;
+                    let in_point = op.source_point.with_context(|| {
+                        format!("graph[{index}]: avg_pool2x without a source_point")
                     })?;
                     let src = points
-                        .get(point)
+                        .get(in_point)
                         .and_then(|p| p.as_ref())
-                        .with_context(|| format!("graph[{index}]: point {point} is not live"))?;
-                    points[point] = Some(instance_norm(spec, src, m.act_qmax)?);
+                        .with_context(|| format!("graph[{index}]: point {in_point} is not live"))?;
+                    let out_scale = op.scale.unwrap_or(m.point_scales[out_point]);
+                    points[out_point] = Some(avg_pool2x(
+                        src,
+                        m.point_scales[in_point],
+                        out_scale,
+                        m.act_qmax,
+                    )?);
                 }
                 "film" => {
                     let name = op
@@ -552,6 +584,80 @@ fn lut_conv(layer: &LutLayer, input: &Act, source_scale: f32) -> Result<Act> {
         h: out_h,
         w: out_w,
         data,
+    })
+}
+
+fn avg_pool2x(input: &Act, in_scale: f32, out_scale: f32, qmax: f32) -> Result<Act> {
+    if input.h % 2 != 0 || input.w % 2 != 0 {
+        bail!(
+            "avg_pool2x needs even spatial size, got {}x{}",
+            input.h,
+            input.w
+        );
+    }
+    let out_h = input.h / 2;
+    let out_w = input.w / 2;
+    let mut data = vec![0i32; input.c * out_h * out_w];
+    for c in 0..input.c {
+        for oy in 0..out_h {
+            for ox in 0..out_w {
+                let mut sum = 0.0f32;
+                for dy in 0..2 {
+                    for dx in 0..2 {
+                        let y = oy * 2 + dy;
+                        let x = ox * 2 + dx;
+                        sum += input.data[(c * input.h + y) * input.w + x] as f32 * in_scale;
+                    }
+                }
+                data[(c * out_h + oy) * out_w + ox] =
+                    round_clamp((sum / 4.0) / out_scale, -qmax, qmax);
+            }
+        }
+    }
+    Ok(Act {
+        c: input.c,
+        h: out_h,
+        w: out_w,
+        data,
+    })
+}
+
+fn layer_norm(spec: &InstanceNormLayer, input: &Act, qmax: f32) -> Result<Act> {
+    if input.c != spec.channels {
+        bail!(
+            "{} expects {} channels, got {}",
+            spec.name,
+            spec.channels,
+            input.c
+        );
+    }
+    let plane = input.h * input.w;
+    let channels = spec.channels as f32;
+    let mut out = vec![0i32; input.data.len()];
+    for i in 0..plane {
+        let mut sum = 0.0f32;
+        for c in 0..spec.channels {
+            sum += input.data[c * plane + i] as f32 * spec.in_scale;
+        }
+        let mean = sum / channels;
+        let mut var = 0.0f32;
+        for c in 0..spec.channels {
+            let x = input.data[c * plane + i] as f32 * spec.in_scale - mean;
+            var += x * x;
+        }
+        var /= channels;
+        let inv = 1.0 / (var + spec.eps).sqrt();
+        for c in 0..spec.channels {
+            let x = input.data[c * plane + i] as f32 * spec.in_scale;
+            let y = spec.gamma[c] * (x - mean) * inv + spec.beta[c];
+            out[c * plane + i] = round_clamp(y / spec.out_scale, -qmax, qmax);
+        }
+    }
+    Ok(Act {
+        c: input.c,
+        h: input.h,
+        w: input.w,
+        data: out,
     })
 }
 

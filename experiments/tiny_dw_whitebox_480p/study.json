@@ -1,0 +1,20 @@
+{
+  "id": "tiny_dw_whitebox_480p",
+  "base_config": "experiments/tiny_dw_whitebox_480p/base.json",
+  "trials": [
+    {
+      "id": "ln",
+      "patch": {}
+    },
+    {
+      "id": "in",
+      "patch": {
+        "student": {
+          "options": {
+            "trunk_norm_kind": "in"
+          }
+        }
+      }
+    }
+  ]
+}

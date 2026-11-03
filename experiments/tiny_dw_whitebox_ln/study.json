@@ -1,0 +1,119 @@
+{
+  "id": "tiny_dw_whitebox_ln",
+  "base_config": "experiments/tiny_dw_whitebox_ln/base.json",
+  "trials": [
+    {
+      "id": "a_base",
+      "patch": {}
+    },
+    {
+      "id": "b_ln_res0",
+      "patch": {
+        "student": {
+          "options": {
+            "res_blocks": 0
+          }
+        }
+      }
+    },
+    {
+      "id": "c_ln_res2",
+      "patch": {
+        "student": {
+          "options": {
+            "res_blocks": 2
+          }
+        }
+      }
+    },
+    {
+      "id": "d_ln_trunk128",
+      "patch": {
+        "student": {
+          "options": {
+            "trunk": 128
+          }
+        }
+      }
+    },
+    {
+      "id": "e_guide16",
+      "patch": {
+        "student": {
+          "options": {
+            "guide": 16
+          }
+        }
+      }
+    },
+    {
+      "id": "f_guide16_full16",
+      "patch": {
+        "student": {
+          "options": {
+            "guide": 16,
+            "full": 16
+          }
+        }
+      }
+    },
+    {
+      "id": "g_guide24_full32x2",
+      "patch": {
+        "student": {
+          "options": {
+            "guide": 24,
+            "full": 32,
+            "full_layers": 2
+          }
+        }
+      }
+    },
+    {
+      "id": "h_no_film_h2",
+      "patch": {
+        "student": {
+          "options": {
+            "film_h2": 0
+          }
+        }
+      }
+    },
+    {
+      "id": "i_h2_guide8",
+      "patch": {
+        "student": {
+          "options": {
+            "h2_guide": 8
+          }
+        }
+      }
+    },
+    {
+      "id": "j_ref_in",
+      "patch": {
+        "student": {
+          "options": {
+            "trunk_norm_kind": "in"
+          }
+        }
+      }
+    },
+    {
+      "id": "k_line2",
+      "patch": {
+        "loss": {
+          "line": 2
+        }
+      }
+    },
+    {
+      "id": "l_seed1",
+      "patch": {
+        "run": {
+          "seed": 1
+        }
+      }
+    }
+  ]
+}

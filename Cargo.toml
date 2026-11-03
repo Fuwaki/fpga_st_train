@@ -10,12 +10,20 @@ description = "FPGA-friendly style transfer: MicroAST teacher inference + distil
 #   cargo run --release --no-default-features --features cuda
 #   cargo run --release --no-default-features --features vulkan
 #   cargo run --release --no-default-features --features ndarray
-default = ["cuda"]
+default = ["cuda", "ort-webgpu"]
 cuda = ["burn/cuda"]
 wgpu = ["burn/wgpu"]
 vulkan = ["burn/wgpu", "burn/vulkan"]
 # Pure-CPU fallback / correctness oracle: --no-default-features --features ndarray
-ndarray = ["burn/ndarray"]
+ndarray = ["burn/ndarray", "ort/download-binaries", "ort/copy-dylibs"]
+# WebGPU teacher, linked against the prebuilt ONNX Runtime (glibc 2.38).
+ort-webgpu = ["ort/webgpu", "ort/download-binaries", "ort/copy-dylibs"]
+# Load libonnxruntime.so at runtime via ORT_DYLIB_PATH. Used when the prebuilt
+# binary does not link (Ubuntu 22.04 is glibc 2.35).
+ort-dynamic = ["ort/load-dynamic"]
+# CUDA execution provider for a machine with no AMD GPU. The published binary
+# that matches this crate's ORT is the cuda13 + nvrtx + tensorrt set.
+teacher-cuda = ["ort/cuda", "ort/nvrtx", "ort/tensorrt"]
 
 [dependencies]
 # --- deep learning ---
@@ -27,6 +35,8 @@ anyhow = "1"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+rmp-serde = "1.3"
+rmpv = { version = "1.3", features = ["with-serde"] }
 # --- cli / logging ---
 clap = { version = "4", features = ["derive"] }
 log = "0.4"
@@ -42,6 +52,6 @@ arrow = "55"
 ureq = { version = "2", features = ["json"] }
 # ONNX Runtime for the distillation teachers. WebGPU/Dawn/Vulkan targets the AMD GPU
 # while training stays on CUDA. `ndarray` is how host tensors cross the boundary.
-ort = { version = "2.0.0-rc.15", features = ["webgpu", "ndarray"] }
+ort = { version = "2.0.0-rc.15", default-features = false, features = ["std", "ndarray", "tracing", "tls-native", "api-31"] }
 ash = "0.38"
 ndarray = "0.17"

@@ -12,7 +12,6 @@ use crate::student::StudentModel;
 use crate::{InferBackend, TrainBackend};
 use anyhow::Result;
 use burn::module::AutodiffModule;
-use burn::record::{FullPrecisionSettings, NamedMpkFileRecorder};
 
 pub(crate) fn invoke_calibrate<M, F>(
     job: &CalibrationJob,
@@ -43,11 +42,7 @@ where
     M::InnerModule: Exportable,
     F: Fn(&StudentConfig, &TrainDevice) -> M,
 {
-    let recorder = NamedMpkFileRecorder::<FullPrecisionSettings>::new();
-    let model = build(student, device)
-        .load_file(checkpoint.to_path_buf(), &recorder, device)
-        .map_err(|e| anyhow::anyhow!("cannot load {}: {e}", checkpoint.display()))?
-        .valid();
+    let model = crate::train::load_module(build(student, device), checkpoint, device)?.valid();
     crate::export::export_int8(&model, calibration, out)
 }
 
@@ -62,10 +57,6 @@ where
     M::InnerModule: StudentModel<InferBackend> + Quantizable<InferBackend> + 'static,
     F: Fn(&StudentConfig, &TrainDevice) -> M,
 {
-    let recorder = NamedMpkFileRecorder::<FullPrecisionSettings>::new();
-    let model = build(student, device)
-        .load_file(checkpoint.to_path_buf(), &recorder, device)
-        .map_err(|e| anyhow::anyhow!("cannot load {}: {e}", checkpoint.display()))?
-        .valid();
+    let model = crate::train::load_module(build(student, device), checkpoint, device)?.valid();
     Ok(StudentHandle::new(model))
 }

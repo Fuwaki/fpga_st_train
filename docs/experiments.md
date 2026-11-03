@@ -80,6 +80,19 @@ python scripts/study_collect.py experiments/dw_vangogh_lr
 
 单次训练仍可用 `scripts/train.sh <tag>`，但 tag 应对应 `configs/<tag>.json`。**对比实验优先用 study 流程**，避免 `configs/` 里堆几十个手写文件。
 
+部署尺寸与训练 crop 不同时，校准应显式指定目标帧尺寸，避免用方形 crop 估计部署激活范围：
+
+```bash
+fpga_st_train calibrate \
+  --model experiments/tiny_dw_whitebox_480p/trials/ln \
+  --content ../style-transfer/demo_inputs \
+  --frame-width 640 --frame-height 480 \
+  --batch-size 1 --batches 20 --safety 1.05 --bits w8a8 \
+  --out /tmp/tiny-dw-640x480-calibration.json
+```
+
+`--frame-width` 与 `--frame-height` 必须同时提供；省略时仍使用 `--crop` 指定的正方形校准窗口。
+
 ## 生成器：Python，不是 Rust
 
 | 用 Python | 用 Rust |

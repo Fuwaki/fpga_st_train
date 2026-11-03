@@ -15,9 +15,11 @@ use std::sync::{Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 
 use anyhow::{Context, Result, bail};
+#[cfg(feature = "ort-webgpu")]
 use ash::vk;
 use burn::tensor::{Tensor, TensorData};
 use ndarray::Array4;
+#[cfg(feature = "ort-webgpu")]
 use ort::ep::webgpu::{DawnBackendType, WebGPU};
 use ort::session::Session;
 use ort::value::TensorRef;
@@ -26,6 +28,7 @@ use crate::backend::InferBackend;
 use crate::config::TeacherKind;
 use crate::teacher::DistillTeacher;
 
+#[cfg(feature = "ort-webgpu")]
 const AMD_VENDOR: u32 = 0x1002;
 
 struct OnnxJob {
@@ -143,8 +146,6 @@ impl Drop for OnnxTeacher {
 
 impl OnnxSession {
     fn open(kind: TeacherKind, model: &Path) -> Result<Self> {
-        let (device_id, device_label) = amd_vulkan_device()?;
-        println!("WebGPU device: {device_label} (vendor {AMD_VENDOR:#06x}, deviceId {device_id})");
         let (session_model, batched) = match kind {
             // Opset-9 Upsample scales are a Shape/Floor subgraph. WebGPU mis-sizes
             // that subgraph (192 -> 190). Constant 2x scales match the CPU graph exactly.
@@ -152,19 +153,12 @@ impl OnnxSession {
             // One call per batch: 381 ms for 32×192² on the Vega against 1017 ms as
             // 32 single-image runs, with bit-identical output.
             TeacherKind::Whitebox => (whitebox_dynamic_batch(model)?, true),
+            // Exported with dynamic N,H,W. Values are 0–255; the runner scales them.
+            TeacherKind::Fns => (model.to_path_buf(), true),
             TeacherKind::MicroAst => (model.to_path_buf(), false),
         };
         let env = ort_env()?;
-        let session = Session::builder(env)
-            .map_err(ort_anyhow)?
-            .with_execution_providers([WebGPU::default()
-                .with_dawn_backend_type(DawnBackendType::Vulkan)
-                .with_device_id(device_id)
-                .build()])
-            .map_err(ort_anyhow)?
-            .commit_from_file(&session_model)
-            .map_err(ort_anyhow)
-            .with_context(|| format!("failed to load ONNX teacher {}", model.display()))?;
+        let (session, device_label) = commit_teacher_session(env, &session_model)?;
         let input_name = session.inputs()[0].name().to_owned();
         log::info!(
             "onnx teacher {} loaded from {} (input {input_name})",
@@ -193,8 +187,31 @@ impl OnnxSession {
         match self.kind {
             TeacherKind::RainPrincess => self.run_rain(nchw01, n, h, w),
             TeacherKind::Whitebox => self.run_whitebox(nchw01, n, h, w),
+            TeacherKind::Fns => self.run_fns(nchw01, n, h, w),
             TeacherKind::MicroAst => bail!("microast is not an ONNX teacher"),
         }
+    }
+
+    /// Fast Neural Style: NCHW in 0–255, same layout out. The graph is exact size.
+    fn run_fns(&self, nchw01: &[f32], n: usize, h: usize, w: usize) -> Result<Vec<f32>> {
+        if !h.is_multiple_of(4) || !w.is_multiple_of(4) {
+            bail!("fns teacher needs H and W to be multiples of 4, got {h}x{w}");
+        }
+        let scaled: Vec<f32> = nchw01.iter().map(|v| v * 255.0).collect();
+        let input = Array4::from_shape_vec((n, 3, h, w), scaled)
+            .context("fns input is not contiguous NCHW")?;
+        let (shape, data) = self.run_session(input.view())?;
+        let (on, oc, oh, ow) = match shape.as_slice() {
+            [on, oc, oh, ow] => (*on, *oc, *oh, *ow),
+            other => bail!("fns output rank/shape {other:?}, expected NCHW"),
+        };
+        if on != n || oc != 3 || oh != h || ow != w {
+            bail!("fns output {on}x{oc}x{oh}x{ow} is not {n}x3x{h}x{w}");
+        }
+        Ok(data
+            .into_iter()
+            .map(|v| (v / 255.0).clamp(0.0, 1.0))
+            .collect())
     }
 
     fn run_rain(&self, nchw01: &[f32], n: usize, h: usize, w: usize) -> Result<Vec<f32>> {
@@ -385,7 +402,7 @@ fn rewrite_onnx(model: &Path, script: &str, out_name: &str) -> Result<PathBuf> {
         .map(|root| root.join(".venv/bin/python"))
         .filter(|path| path.is_file())
         .context("rewriting the ONNX graph needs the teachers .venv next to the model directory")?;
-    let python = python.canonicalize().unwrap_or(python);
+    // Run the venv symlink itself so Python adds that venv's site-packages, where `onnx` is installed.
     let model = model.canonicalize().unwrap_or_else(|_| model.to_path_buf());
     let out = std::env::temp_dir().join(out_name);
     let status = Command::new(python)
@@ -415,11 +432,114 @@ fn ort_env() -> Result<&'static ort::environment::Environment> {
     ENV.get().context("ONNX Runtime environment was not stored")
 }
 
+fn commit_teacher_session(
+    env: &ort::environment::Environment,
+    model: &Path,
+) -> Result<(Session, String)> {
+    #[cfg(feature = "teacher-cuda")]
+    {
+        println!("ONNX teacher on CUDA execution provider");
+        let session = Session::builder(env)
+            .map_err(ort_anyhow)?
+            .with_execution_providers([ort::ep::CUDA::default().build()])
+            .map_err(ort_anyhow)
+            .context("CUDA execution provider")?
+            .commit_from_file(model)
+            .map_err(ort_anyhow)
+            .with_context(|| format!("failed to load ONNX teacher {}", model.display()))?;
+        return Ok((session, "CUDA".to_owned()));
+    }
+    #[cfg(all(feature = "ort-webgpu", not(feature = "teacher-cuda")))]
+    {
+        let builder = Session::builder(env).map_err(ort_anyhow)?;
+        let (mut builder, label) = match teacher_vulkan_device() {
+            Ok((device_id, device_label, vendor)) => {
+                println!(
+                    "WebGPU device: {device_label} (vendor {vendor:#06x}, deviceId {device_id})"
+                );
+                let builder = builder
+                    .with_execution_providers([WebGPU::default()
+                        .with_dawn_backend_type(DawnBackendType::Vulkan)
+                        .with_device_id(device_id)
+                        .build()])
+                    .map_err(ort_anyhow)?;
+                (builder, device_label)
+            }
+            Err(err) => {
+                println!("ONNX teacher on CPU: {err:#}");
+                (builder, "CPU".to_owned())
+            }
+        };
+        let session = builder
+            .commit_from_file(model)
+            .map_err(ort_anyhow)
+            .with_context(|| format!("failed to load ONNX teacher {}", model.display()))?;
+        Ok((session, label))
+    }
+    #[cfg(all(not(feature = "teacher-cuda"), not(feature = "ort-webgpu")))]
+    {
+        println!("ONNX teacher on CPU");
+        let session = Session::builder(env)
+            .map_err(ort_anyhow)?
+            .commit_from_file(model)
+            .map_err(ort_anyhow)
+            .with_context(|| format!("failed to load ONNX teacher {}", model.display()))?;
+        Ok((session, "CPU".to_owned()))
+    }
+}
+
+/// Pick the Vulkan adapter the ONNX teacher should run on.
+///
+/// When RADV is installed, stay on the Vega so the teacher does not land on the
+/// NVIDIA card that is already training. A machine with only NVIDIA (no RADV ICD)
+/// uses that card instead.
+#[cfg(all(feature = "ort-webgpu", not(feature = "teacher-cuda")))]
+fn teacher_vulkan_device() -> Result<(i32, String, u32)> {
+    if radv_icd().is_ok() {
+        let (index, label) = amd_vulkan_device()?;
+        return Ok((index, label, AMD_VENDOR));
+    }
+    log::info!("RADV ICD is absent; ONNX teacher will use the first hardware Vulkan device");
+    hardware_vulkan_device()
+}
+
+#[cfg(all(feature = "ort-webgpu", not(feature = "teacher-cuda")))]
+fn hardware_vulkan_device() -> Result<(i32, String, u32)> {
+    let entry = unsafe { ash::Entry::load() }.context("failed to load libvulkan")?;
+    let app = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_1);
+    let info = vk::InstanceCreateInfo::default().application_info(&app);
+    let instance = unsafe { entry.create_instance(&info, None) }
+        .context("failed to create a Vulkan instance")?;
+    let devices = unsafe { instance.enumerate_physical_devices() }
+        .context("failed to enumerate Vulkan devices")?;
+    let mut chosen: Option<(i32, String, u32)> = None;
+    for (index, device) in devices.iter().copied().enumerate() {
+        let props = unsafe { instance.get_physical_device_properties(device) };
+        let name = unsafe { std::ffi::CStr::from_ptr(props.device_name.as_ptr()) }
+            .to_string_lossy()
+            .into_owned();
+        log::info!(
+            "vulkan device {index}: vendor {:#06x} {name}",
+            props.vendor_id
+        );
+        let lower = name.to_ascii_lowercase();
+        if lower.contains("llvmpipe") || lower.contains("swiftshader") {
+            continue;
+        }
+        if chosen.is_none() {
+            chosen = Some((index as i32, name, props.vendor_id));
+        }
+    }
+    unsafe { instance.destroy_instance(None) };
+    chosen.context("no hardware Vulkan device for the ONNX teacher")
+}
+
 /// Restrict Vulkan to RADV, then return Dawn's device index and the adapter name.
 ///
 /// Dawn's WebGPU path asks for the high-performance adapter. With both the Vega
 /// and the V100 visible that can be the NVIDIA card, which is the training GPU.
 /// Setting the ICD list before the loader's first call leaves only vendor `0x1002`.
+#[cfg(all(feature = "ort-webgpu", not(feature = "teacher-cuda")))]
 fn amd_vulkan_device() -> Result<(i32, String)> {
     static PINNED: OnceLock<(i32, String)> = OnceLock::new();
     if let Some(pinned) = PINNED.get() {
@@ -476,6 +596,7 @@ fn amd_vulkan_device() -> Result<(i32, String)> {
     Ok(chosen)
 }
 
+#[cfg(all(feature = "ort-webgpu", not(feature = "teacher-cuda")))]
 fn radv_icd() -> Result<String> {
     const CANDIDATES: &[&str] = &[
         "/usr/share/vulkan/icd.d/radeon_icd.json",

@@ -5,7 +5,7 @@
 //! new weights matches the baseline at step 0. Instance norm, layer norm and SimAM change
 //! the forward pass immediately: that change is the module.
 //!
-//! Only `in` (InstanceNorm) and decoder FiLM are lowered to the integer manifest today.
+//! `in`, `ln`, and decoder FiLM are lowered to the integer manifest. Other plugins are not.
 
 use burn::module::{Module, Param};
 use burn::nn::PaddingConfig2d;
@@ -226,7 +226,7 @@ pub struct NormAffine<B: Backend> {
     #[module(skip)]
     spatial: bool,
     /// Added inside the square root. The default [`EPS`] keeps every existing graph.
-    /// Guided's trunk can pass a smaller value; integer export keeps its own constant.
+    /// Guided's trunk passes its own epsilon, and the integer export uses that same value.
     #[module(skip)]
     eps: f32,
 }
@@ -598,6 +598,14 @@ impl<B: Backend> Plugin<B> {
         plugin
     }
 
+    pub fn layer_norm(channels: usize, eps: f32, device: &B::Device) -> Self {
+        let mut plugin = Self::new(PluginKind::Ln, channels, device);
+        if let Some(norm) = plugin.norm.as_mut() {
+            norm.set_eps(eps);
+        }
+        plugin
+    }
+
     pub fn kind(&self) -> PluginKind {
         self.kind
     }
@@ -633,6 +641,16 @@ impl<B: Backend> Plugin<B> {
             return None;
         }
         Some(self.norm.as_ref().expect("in arm").host_gamma_beta())
+    }
+
+    /// γ, β of a trunk InstanceNorm or LayerNorm.
+    pub fn host_norm(&self) -> Option<Result<(Vec<f32>, Vec<f32>), String>> {
+        match self.kind {
+            PluginKind::In | PluginKind::Ln => {
+                Some(self.norm.as_ref().expect("norm arm").host_gamma_beta())
+            }
+            _ => None,
+        }
     }
 }
 

@@ -44,6 +44,17 @@ pub trait StudentModel<B: Backend>: Module<B> {
     /// Map a content batch [N, 3, H, W] in [0, 1] to a stylised batch of the same shape.
     fn stylize(&self, content: Tensor<B, 4>) -> Tensor<B, 4>;
 
+    /// How many style packets this student can select. The default is one.
+    fn style_count(&self) -> usize {
+        1
+    }
+
+    /// Stylise with one packet. `style` is `0..style_count()`. The default ignores it.
+    fn stylize_style(&self, content: Tensor<B, 4>, style: usize) -> Tensor<B, 4> {
+        let _ = style;
+        self.stylize(content)
+    }
+
     /// One-line description, printed once at startup.
     fn describe(&self) -> String {
         let name = std::any::type_name::<Self>()

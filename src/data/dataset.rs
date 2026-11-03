@@ -139,6 +139,35 @@ impl PairDataset {
     }
 }
 
+/// Scale, preserving aspect, until both edges cover `width`×`height`.
+fn cover(img: &RgbImage, width: u32, height: u32) -> RgbImage {
+    if img.width() >= width && img.height() >= height {
+        return img.clone();
+    }
+    let scale = (width as f32 / img.width() as f32).max(height as f32 / img.height() as f32);
+    let nw = ((img.width() as f32 * scale).ceil() as u32).max(width);
+    let nh = ((img.height() as f32 * scale).ceil() as u32).max(height);
+    image::imageops::resize(img, nw, nh, FilterType::Triangle)
+}
+
+/// Random `width`×`height` window. Smaller images are scaled up first.
+pub fn random_window(img: &RgbImage, width: u32, height: u32, rng: &mut impl Rng) -> RgbImage {
+    let img = cover(img, width, height);
+    let max_x = img.width().saturating_sub(width);
+    let max_y = img.height().saturating_sub(height);
+    let x = if max_x > 0 {
+        rng.random_range(0..=max_x)
+    } else {
+        0
+    };
+    let y = if max_y > 0 {
+        rng.random_range(0..=max_y)
+    } else {
+        0
+    };
+    image::imageops::crop_imm(&img, x, y, width, height).to_image()
+}
+
 /// Resize if needed so both edges are at least size, then take a random crop.
 pub fn random_crop(img: &RgbImage, size: u32, rng: &mut impl Rng) -> RgbImage {
     let img = if img.width() < size || img.height() < size {
@@ -165,9 +194,14 @@ pub fn random_crop(img: &RgbImage, size: u32, rng: &mut impl Rng) -> RgbImage {
 /// Load a pair and crop both members with the *same* window.
 pub fn load_pair_cropped(
     pair: &Pair,
-    size: u32,
+    width: u32,
+    height: u32,
     rng: &mut impl Rng,
 ) -> Result<(RgbImage, Option<RgbImage>)> {
+    if width != height {
+        return load_pair_window(pair, width, height, rng);
+    }
+    let size = width;
     let content = load_rgb_cached(&pair.content)
         .with_context(|| format!("cannot load content {}", pair.content.display()))?;
     let content = (*content).clone();
@@ -196,6 +230,52 @@ pub fn load_pair_cropped(
         return Ok(crop_same(content, target, size, rng));
     }
     Ok(crop_same(content, target, size, rng))
+}
+
+fn load_pair_window(
+    pair: &Pair,
+    width: u32,
+    height: u32,
+    rng: &mut impl Rng,
+) -> Result<(RgbImage, Option<RgbImage>)> {
+    let content = load_rgb_cached(&pair.content)
+        .with_context(|| format!("cannot load content {}", pair.content.display()))?;
+    let content = (*content).clone();
+    let target = match &pair.target {
+        Some(path) => {
+            let t = load_rgb_cached(path)
+                .with_context(|| format!("cannot load target {}", path.display()))?;
+            Some((*t).clone())
+        }
+        None => None,
+    };
+    let (content, target) = match &target {
+        Some(t) => resize_pair_to_common(&content, t, width),
+        None => (content, None),
+    };
+    let content = cover(&content, width, height);
+    let target = target.map(|t| {
+        if t.dimensions() == content.dimensions() {
+            t
+        } else {
+            image::imageops::resize(&t, content.width(), content.height(), FilterType::Triangle)
+        }
+    });
+    let max_x = content.width().saturating_sub(width);
+    let max_y = content.height().saturating_sub(height);
+    let x = if max_x > 0 {
+        rng.random_range(0..=max_x)
+    } else {
+        0
+    };
+    let y = if max_y > 0 {
+        rng.random_range(0..=max_y)
+    } else {
+        0
+    };
+    let cropped = image::imageops::crop_imm(&content, x, y, width, height).to_image();
+    let target = target.map(|t| image::imageops::crop_imm(&t, x, y, width, height).to_image());
+    Ok((cropped, target))
 }
 
 /// Make content and target share a size (the target may differ by a pixel).
@@ -247,4 +327,22 @@ fn crop_same(
         .to_image()
     });
     (c, t)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use image::Rgb;
+    use rand::SeedableRng;
+
+    #[test]
+    fn window_is_exact_on_a_larger_image_and_after_upscale() {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(1);
+        let big = RgbImage::from_pixel(800, 600, Rgb([1, 2, 3]));
+        let cropped = random_window(&big, 640, 480, &mut rng);
+        assert_eq!(cropped.dimensions(), (640, 480));
+        let tiny = RgbImage::from_pixel(20, 10, Rgb([4, 5, 6]));
+        let up = random_window(&tiny, 64, 48, &mut rng);
+        assert_eq!(up.dimensions(), (64, 48));
+    }
 }

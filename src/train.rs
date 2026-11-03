@@ -103,7 +103,8 @@ struct CpuBatch {
 
 fn prepare_cpu_batch(
     dataset: &TrainContentSource,
-    crop: u32,
+    width: u32,
+    height: u32,
     batch: usize,
     rng: &mut StdRng,
 ) -> Result<CpuBatch> {
@@ -114,7 +115,7 @@ fn prepare_cpu_batch(
         .into_par_iter()
         .map(|seed| {
             let mut sample_rng = StdRng::seed_from_u64(seed);
-            dataset.sample_crops(crop, &mut sample_rng)
+            dataset.sample_crops(width, height, &mut sample_rng)
         })
         .collect::<Result<Vec<_>>>()?;
     let mut contents = Vec::with_capacity(batch);
@@ -251,13 +252,14 @@ fn resolve_step_target(
 
 pub(crate) fn build_batch(
     dataset: &TrainContentSource,
-    crop: u32,
+    width: u32,
+    height: u32,
     batch: usize,
     rng: &mut StdRng,
     device: &TrainDevice,
 ) -> Result<Batch> {
     Ok(upload_batch(
-        prepare_cpu_batch(dataset, crop, batch, rng)?,
+        prepare_cpu_batch(dataset, width, height, batch, rng)?,
         device,
     ))
 }
@@ -268,10 +270,45 @@ pub fn load_checkpoint<M: Module<TrainBackend>>(
     path: &std::path::Path,
     device: &TrainDevice,
 ) -> Result<M> {
-    let recorder = NamedMpkFileRecorder::<FullPrecisionSettings>::new();
-    model
-        .load_file(path.to_path_buf(), &recorder, device)
-        .map_err(|e| anyhow::anyhow!("cannot load {}: {e}", path.display()))
+    load_module(model, path, device)
+}
+
+/// Load a named msgpack checkpoint on any backend.
+///
+/// A one-style guided file has no `style_packets` entry. That field is an empty
+/// list until a pack step writes the extra slots, so older files still open.
+pub fn load_module<B: Backend, M: Module<B>>(
+    model: M,
+    path: &std::path::Path,
+    device: &B::Device,
+) -> Result<M> {
+    let bytes = std::fs::read(path).with_context(|| format!("cannot read {}", path.display()))?;
+    let bytes = insert_empty_style_packets(bytes)
+        .map_err(|err| anyhow::anyhow!("cannot prepare {}: {err}", path.display()))?;
+    let recorder = burn::record::NamedMpkBytesRecorder::<FullPrecisionSettings>::default();
+    let record = burn::record::Recorder::<B>::load(&recorder, bytes, device)
+        .map_err(|err| anyhow::anyhow!("cannot load {}: {err}", path.display()))?;
+    Ok(model.load_record(record))
+}
+
+fn insert_empty_style_packets(bytes: Vec<u8>) -> Result<Vec<u8>, String> {
+    let mut value: rmpv::Value = rmp_serde::from_slice(&bytes).map_err(|err| err.to_string())?;
+    let rmpv::Value::Map(root) = &mut value else {
+        return Ok(bytes);
+    };
+    let item_key = rmpv::Value::String("item".into());
+    let Some(item) = root.iter_mut().find(|(key, _)| key == &item_key) else {
+        return Ok(bytes);
+    };
+    let rmpv::Value::Map(fields) = &mut item.1 else {
+        return Ok(bytes);
+    };
+    let packet_key = rmpv::Value::String("style_packets".into());
+    if fields.iter().any(|(key, _)| key == &packet_key) {
+        return Ok(bytes);
+    }
+    fields.push((packet_key, rmpv::Value::Array(Vec::new())));
+    rmp_serde::to_vec_named(&value).map_err(|err| err.to_string())
 }
 
 /// Fixed seed for the held-out val batch (same crops on every `val_every` step).
@@ -397,6 +434,49 @@ impl<B: Backend> LossParts<B> {
     }
 }
 
+fn add_loss<B: Backend>(
+    left: Option<Tensor<B, 1>>,
+    right: Option<Tensor<B, 1>>,
+) -> Option<Tensor<B, 1>> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left + right),
+        (None, None) => None,
+        _ => panic!("style losses do not have the same terms"),
+    }
+}
+
+fn mean_loss<B: Backend>(parts: Vec<LossParts<B>>) -> LossParts<B> {
+    let n = parts.len() as f32;
+    let mut iter = parts.into_iter();
+    let mut acc = iter.next().expect("at least one style");
+    for next in iter {
+        acc.total = acc.total + next.total;
+        acc.pixel = acc.pixel + next.pixel;
+        acc.flat = acc.flat + next.flat;
+        acc.edge = acc.edge + next.edge;
+        acc.contrast = acc.contrast + next.contrast;
+        acc.gradient = add_loss(acc.gradient, next.gradient);
+        acc.stroke = add_loss(acc.stroke, next.stroke);
+        acc.line = add_loss(acc.line, next.line);
+        acc.texture = add_loss(acc.texture, next.texture);
+        acc.feature = add_loss(acc.feature, next.feature);
+        acc.tv = add_loss(acc.tv, next.tv);
+    }
+    let scale = |tensor: Tensor<B, 1>| tensor.div_scalar(n);
+    acc.total = scale(acc.total);
+    acc.pixel = scale(acc.pixel);
+    acc.flat = scale(acc.flat);
+    acc.edge = scale(acc.edge);
+    acc.contrast = scale(acc.contrast);
+    acc.gradient = acc.gradient.map(&scale);
+    acc.stroke = acc.stroke.map(&scale);
+    acc.line = acc.line.map(&scale);
+    acc.texture = acc.texture.map(&scale);
+    acc.feature = acc.feature.map(&scale);
+    acc.tv = acc.tv.map(scale);
+    acc
+}
+
 fn forward_loss<B: Backend, M: StudentModel<B> + Quantizable<B>>(
     model: &M,
     content: Tensor<B, 4>,
@@ -405,10 +485,15 @@ fn forward_loss<B: Backend, M: StudentModel<B> + Quantizable<B>>(
     feature_scales: &[f32],
     weights: &LossWeights,
     quant_scheme: Option<&crate::quant::QuantScheme>,
+    style: usize,
 ) -> LossParts<B> {
-    let (output, student_feats) = match quant_scheme {
-        Some(scheme) => (model.forward_quantised(content, scheme), Vec::new()),
-        None => model.intermediate(content),
+    let (output, student_feats) = if style == 0 {
+        match quant_scheme {
+            Some(scheme) => (model.forward_quantised(content, scheme), Vec::new()),
+            None => model.intermediate(content),
+        }
+    } else {
+        (model.stylize_style(content, style), Vec::new())
     };
 
     let pixel = losses::l1(output.clone(), target.clone());
@@ -544,7 +629,7 @@ trait CohortSlot {
         iterations: usize,
         checkpoint_every: usize,
         sample_every: usize,
-        teacher: Option<&dyn DistillTeacher>,
+        supervision: &Supervision,
         device: &TrainDevice,
     ) -> Result<()>;
 
@@ -578,6 +663,7 @@ where
             feature_scales,
             &weights,
             self.quant_scheme.as_ref(),
+            0,
         );
         let grads = GradientsParams::from_grads(
             parts.total.clone().backward(),
@@ -637,6 +723,7 @@ where
             feature_scales,
             &weights,
             self.quant_scheme.as_ref(),
+            0,
         );
         let val_metrics = val_parts.val_metrics();
         let prefix = if cohort {
@@ -659,7 +746,7 @@ where
         iterations: usize,
         checkpoint_every: usize,
         sample_every: usize,
-        teacher: Option<&dyn DistillTeacher>,
+        supervision: &Supervision,
         device: &TrainDevice,
     ) -> Result<()> {
         if checkpoint_every > 0 && step % checkpoint_every == 0 {
@@ -672,19 +759,49 @@ where
             )?;
         }
         if sample_every > 0 && (step % sample_every == 0 || step == iterations) {
+            let styles = supervision.sample_styles();
             for (name, img) in &self.sample_images {
-                match sample(
-                    self.model.as_ref().expect("student"),
-                    img,
-                    name,
-                    teacher,
-                    &self.config.run.output_dir,
-                    step,
-                    device,
-                    &self.config.run.name,
-                ) {
-                    Ok(metrics) => self.run_log.sample_eval(step, name, metrics)?,
-                    Err(e) => log::warn!("could not write sample '{name}' at step {step}: {e}"),
+                if styles.is_empty() {
+                    match sample(
+                        self.model.as_ref().expect("student"),
+                        img,
+                        name,
+                        None,
+                        &self.config.run.output_dir,
+                        step,
+                        device,
+                        &self.config.run.name,
+                        0,
+                        "",
+                    ) {
+                        Ok(metrics) => self.run_log.sample_eval(step, name, metrics)?,
+                        Err(e) => log::warn!("could not write sample '{name}' at step {step}: {e}"),
+                    }
+                    continue;
+                }
+                for (style_index, style) in styles.iter().enumerate() {
+                    let sample_name = if style.name.is_empty() {
+                        name.to_owned()
+                    } else {
+                        format!("{name}:{}", style.name)
+                    };
+                    match sample(
+                        self.model.as_ref().expect("student"),
+                        img,
+                        &sample_name,
+                        Some(style.teacher),
+                        &self.config.run.output_dir,
+                        step,
+                        device,
+                        &self.config.run.name,
+                        style_index,
+                        style.name,
+                    ) {
+                        Ok(metrics) => self.run_log.sample_eval(step, &sample_name, metrics)?,
+                        Err(e) => {
+                            log::warn!("could not write sample '{sample_name}' at step {step}: {e}")
+                        }
+                    }
                 }
             }
         }
@@ -796,9 +913,21 @@ where
     let mut rng = StdRng::seed_from_u64(config0.run.seed);
 
     let dataset = Arc::new(TrainContentSource::build(&config0.data)?);
-    let crop = config0.data.crop as u32;
+    let (frame_w, frame_h) = config0.data.sample_frame();
     let batch = config0.data.batch_size;
     let supervision = Supervision::try_from_config(&config0, &device)?;
+    if supervision.is_multi() {
+        let names = (0..supervision.n_styles())
+            .map(|index| supervision.style_name(index))
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!(
+            "style packets: {names}; shared convolutions, per-style norm and FiLM; the step loss is the mean"
+        );
+        if config0.run.val_every > 0 {
+            bail!("style-packet runs keep val_every at 0; samples cover each style");
+        }
+    }
 
     let feature_weight = configs
         .iter()
@@ -857,6 +986,14 @@ where
             log::info!("warm start from {}", path.display());
         }
         model.after_load();
+        if supervision.is_multi() && model.style_count() != supervision.n_styles() {
+            bail!(
+                "{} has {} style packets, teacher list has {}",
+                config.run.name,
+                model.style_count(),
+                supervision.n_styles()
+            );
+        }
         log::info!("student: {}", model.describe());
 
         let optimiser = AdamConfig::new()
@@ -873,7 +1010,7 @@ where
         };
         let weights = LossWeights::from_config(&config.loss);
         println!(
-            "{prefix}training '{}' for {} steps: batch {batch}, crop {crop}, device {}, init seed {}, loss = {}",
+            "{prefix}training '{}' for {} steps: batch {batch}, frame {frame_w}x{frame_h}, device {}, init seed {}, loss = {}",
             config.run.name,
             config.optim.iterations,
             config.run.device,
@@ -918,7 +1055,7 @@ where
     TrainBackend::seed(&device, config0.run.seed);
     let feature_scales: Vec<f32> = if feature_weight > 0.0 {
         let teacher = supervision.teacher().expect("checked above");
-        let probe = build_batch(&dataset, crop, batch, &mut rng, &device)?;
+        let probe = build_batch(&dataset, frame_w, frame_h, batch, &mut rng, &device)?;
         let probe = probe.content.inner();
         let (_, feats) = teacher.features(probe)?;
         let scales: Vec<f32> = feats
@@ -955,7 +1092,8 @@ where
         .spawn(move || {
             let mut train_rng = rng;
             for _ in 0..iterations {
-                let batch = prepare_cpu_batch(&producer_dataset, crop, batch, &mut train_rng);
+                let batch =
+                    prepare_cpu_batch(&producer_dataset, frame_w, frame_h, batch, &mut train_rng);
                 if batch_tx.send(batch).is_err() {
                     break;
                 }
@@ -984,24 +1122,33 @@ where
         };
         let batch_data = upload_batch(cpu_batch, &device);
         let content = batch_data.content;
-        let (target, teacher_feats) = if let Some(buf) = host_target {
+        let (targets, teacher_feats) = if supervision.is_multi() {
+            let mut targets = Vec::with_capacity(supervision.n_styles());
+            for index in 0..supervision.n_styles() {
+                targets.push(supervision.stylize_style(index, content.clone())?);
+            }
+            (targets, Vec::new())
+        } else if let Some(buf) = host_target {
             let [n, _, h, w] = content.dims();
-            (host_target_tensor(buf, n, h, w, &device)?, Vec::new())
+            (vec![host_target_tensor(buf, n, h, w, &device)?], Vec::new())
         } else {
-            resolve_step_target(
+            let (target, feats) = resolve_step_target(
                 &supervision,
                 content.clone(),
                 batch_data.target,
                 feature_weight > 0.0,
                 remember_target,
                 &mut cached_target,
-            )?
+            )?;
+            (vec![target], feats)
         };
         // Materialise the teacher so its activations drop back into the CUDA
         // pool as free slices. Do not return those pages to the driver: a new
         // 487 MiB page does not allocate on this T10, and the student reuses
         // the slices the teacher already reserved.
-        let _ = target.clone().sum().into_scalar();
+        for target in &targets {
+            let _ = target.clone().sum().into_scalar();
+        }
         let log_this = log_every > 0 && (step % log_every == 0 || step == iterations);
         if overlap_teacher && step < iterations {
             ahead = Some(launch_host_ahead(&batch_rx, &supervision)?);
@@ -1009,15 +1156,39 @@ where
 
         for slot in &mut slots {
             let weights = slot.weights;
-            let parts = forward_loss(
-                slot.model.as_ref().expect("student"),
-                content.clone(),
-                target.clone(),
-                &teacher_feats,
-                &feature_scales,
-                &weights,
-                slot.quant_scheme.as_ref(),
-            );
+            let (parts, style_l1) = if targets.len() == 1 {
+                (
+                    forward_loss(
+                        slot.model.as_ref().expect("student"),
+                        content.clone(),
+                        targets[0].clone(),
+                        &teacher_feats,
+                        &feature_scales,
+                        &weights,
+                        slot.quant_scheme.as_ref(),
+                        0,
+                    ),
+                    Vec::new(),
+                )
+            } else {
+                let mut parts = Vec::with_capacity(targets.len());
+                let mut l1s = Vec::with_capacity(targets.len());
+                for (index, target) in targets.iter().enumerate() {
+                    let part = forward_loss(
+                        slot.model.as_ref().expect("student"),
+                        content.clone(),
+                        target.clone(),
+                        &teacher_feats,
+                        &feature_scales,
+                        &weights,
+                        slot.quant_scheme.as_ref(),
+                        index,
+                    );
+                    l1s.push(part.pixel.clone().into_scalar().to_f64());
+                    parts.push(part);
+                }
+                (mean_loss(parts), l1s)
+            };
             let grads = GradientsParams::from_grads(
                 parts.total.clone().backward(),
                 slot.model.as_ref().expect("student"),
@@ -1033,8 +1204,19 @@ where
                 } else {
                     String::new()
                 };
+                let style_note = if style_l1.is_empty() {
+                    String::new()
+                } else {
+                    let bits = style_l1
+                        .iter()
+                        .enumerate()
+                        .map(|(index, l1)| format!("{} {l1:.5}", supervision.style_name(index)))
+                        .collect::<Vec<_>>()
+                        .join("  ");
+                    format!("  [{bits}]")
+                };
                 println!(
-                    "{prefix}step {step:>7}/{:<7} loss {:>9.5}  l1 {:.5}  grad {:.5}  flat {:.5}  edge {:.5}  contrast {:.5}  stroke {:.5}  line {:.5}  tex {:.5}  feat {:.5}  tv {:.5}  lr {:.3e}  {:.2} step/s  {:.1} s",
+                    "{prefix}step {step:>7}/{:<7} loss {:>9.5}  l1 {:.5}  grad {:.5}  flat {:.5}  edge {:.5}  contrast {:.5}  stroke {:.5}  line {:.5}  tex {:.5}  feat {:.5}  tv {:.5}  lr {:.3e}  {:.2} step/s  {:.1} s{style_note}",
                     iterations,
                     metrics.loss,
                     metrics.l1.unwrap_or(0.0),
@@ -1058,7 +1240,14 @@ where
 
         reclaim_teacher(&mut ahead, step, iterations, val_every, sample_every)?;
         if val_every > 0 && step % val_every == 0 {
-            let val_data = build_batch(&dataset, crop, val_batch_size, &mut val_rng, &device)?;
+            let val_data = build_batch(
+                &dataset,
+                frame_w,
+                frame_h,
+                val_batch_size,
+                &mut val_rng,
+                &device,
+            )?;
             let (val_target, val_teacher_feats) = supervision.resolve_batch(
                 val_data.content.clone(),
                 val_data.target,
@@ -1079,6 +1268,7 @@ where
                     &feature_scales,
                     &weights,
                     slot.quant_scheme.as_ref(),
+                    0,
                 );
                 let val_metrics = val_parts.val_metrics();
                 let prefix = if cohort {
@@ -1108,20 +1298,50 @@ where
             // The final step is always sampled, so a 2-step smoke still writes
             // target_*.png when sample_every is the full-run interval.
             if sample_every > 0 && (step % sample_every == 0 || step == iterations) {
+                let styles = supervision.sample_styles();
                 for (name, img) in &slot.sample_images {
-                    match sample(
-                        slot.model.as_ref().expect("student"),
-                        img,
-                        name,
-                        supervision.teacher(),
-                        &slot.config.run.output_dir,
-                        step,
-                        &device,
-                        &slot.config.run.name,
-                    ) {
-                        Ok(metrics) => slot.run_log.sample_eval(step, name, metrics)?,
-                        Err(e) => {
-                            log::warn!("could not write sample '{name}' at step {step}: {e}");
+                    if styles.is_empty() {
+                        match sample(
+                            slot.model.as_ref().expect("student"),
+                            img,
+                            name,
+                            None,
+                            &slot.config.run.output_dir,
+                            step,
+                            &device,
+                            &slot.config.run.name,
+                            0,
+                            "",
+                        ) {
+                            Ok(metrics) => slot.run_log.sample_eval(step, name, metrics)?,
+                            Err(e) => {
+                                log::warn!("could not write sample '{name}' at step {step}: {e}")
+                            }
+                        }
+                        continue;
+                    }
+                    for (style_index, style) in styles.iter().enumerate() {
+                        let sample_name = if style.name.is_empty() {
+                            name.to_owned()
+                        } else {
+                            format!("{name}:{}", style.name)
+                        };
+                        match sample(
+                            slot.model.as_ref().expect("student"),
+                            img,
+                            &sample_name,
+                            Some(style.teacher),
+                            &slot.config.run.output_dir,
+                            step,
+                            &device,
+                            &slot.config.run.name,
+                            style_index,
+                            style.name,
+                        ) {
+                            Ok(metrics) => slot.run_log.sample_eval(step, &sample_name, metrics)?,
+                            Err(e) => log::warn!(
+                                "could not write sample '{sample_name}' at step {step}: {e}"
+                            ),
                         }
                     }
                 }
@@ -1206,12 +1426,14 @@ where
         String::new()
     };
     let weights = LossWeights::from_config(&config.loss);
+    let (frame_w, frame_h) = config.data.sample_frame();
     println!(
-        "{prefix}training '{}' for {} steps: batch {}, crop {}, device {}, init seed {}, loss = {}",
+        "{prefix}training '{}' for {} steps: batch {}, frame {}x{}, device {}, init seed {}, loss = {}",
         config.run.name,
         config.optim.iterations,
         config.data.batch_size,
-        config.data.crop,
+        frame_w,
+        frame_h,
         config.run.device,
         config.run.seed,
         weights.formula(),
@@ -1279,7 +1501,7 @@ fn build_guided(
 ) -> Result<crate::student::guided::GuidedStudent<TrainBackend>> {
     let spec =
         crate::student::guided::GuideSpec::from_config(config).map_err(anyhow::Error::msg)?;
-    crate::student::guided::print_cost(spec);
+    crate::student::guided::print_cost(&spec);
     Ok(crate::student::guided::GuidedStudent::new(spec, device))
 }
 
@@ -1327,9 +1549,12 @@ pub fn run_mixed(configs: Vec<Config>, provenances: Vec<RunProvenance>) -> Resul
     let device = select_device(&config0.run.device);
     let mut rng = StdRng::seed_from_u64(config0.run.seed);
     let dataset = Arc::new(TrainContentSource::build(&config0.data)?);
-    let crop = config0.data.crop as u32;
+    let (frame_w, frame_h) = config0.data.sample_frame();
     let batch = config0.data.batch_size;
     let supervision = Supervision::try_from_config(&config0, &device)?;
+    if supervision.is_multi() {
+        bail!("a mixed cohort trains one teacher; style packets use a single student");
+    }
     let feature_weight = configs
         .iter()
         .map(|c| c.loss.feature)
@@ -1373,7 +1598,7 @@ pub fn run_mixed(configs: Vec<Config>, provenances: Vec<RunProvenance>) -> Resul
 
     let feature_scales: Vec<f32> = if feature_weight > 0.0 {
         let teacher = supervision.teacher().expect("checked above");
-        let probe = build_batch(&dataset, crop, batch, &mut rng, &device)?;
+        let probe = build_batch(&dataset, frame_w, frame_h, batch, &mut rng, &device)?;
         let (_, feats) = teacher.features(probe.content.inner())?;
         let scales: Vec<f32> = feats
             .iter()
@@ -1403,7 +1628,8 @@ pub fn run_mixed(configs: Vec<Config>, provenances: Vec<RunProvenance>) -> Resul
         .spawn(move || {
             let mut train_rng = rng;
             for _ in 0..iterations {
-                let batch = prepare_cpu_batch(&producer_dataset, crop, batch, &mut train_rng);
+                let batch =
+                    prepare_cpu_batch(&producer_dataset, frame_w, frame_h, batch, &mut train_rng);
                 if batch_tx.send(batch).is_err() {
                     break;
                 }
@@ -1467,7 +1693,14 @@ pub fn run_mixed(configs: Vec<Config>, provenances: Vec<RunProvenance>) -> Resul
 
         reclaim_teacher(&mut ahead, step, iterations, val_every, sample_every)?;
         if val_every > 0 && step % val_every == 0 {
-            let val_data = build_batch(&dataset, crop, val_batch_size, &mut val_rng, &device)?;
+            let val_data = build_batch(
+                &dataset,
+                frame_w,
+                frame_h,
+                val_batch_size,
+                &mut val_rng,
+                &device,
+            )?;
             let (val_target, val_teacher_feats) = supervision.resolve_batch(
                 val_data.content.clone(),
                 val_data.target,
@@ -1495,7 +1728,7 @@ pub fn run_mixed(configs: Vec<Config>, provenances: Vec<RunProvenance>) -> Resul
                 iterations,
                 checkpoint_every,
                 sample_every,
-                supervision.teacher(),
+                &supervision,
                 &device,
             )?;
         }
@@ -1573,6 +1806,8 @@ fn sample<M>(
     step: usize,
     device: &TrainDevice,
     run_name: &str,
+    style_index: usize,
+    style_name: &str,
 ) -> Result<SampleMetrics>
 where
     M: AutodiffModule<TrainBackend>,
@@ -1585,12 +1820,17 @@ where
     let (w, h) = image.dimensions();
     let padded = crate::data::pad_to_multiple(image, 4);
     let content = rgb_to_tensor::<InferBackend>(&padded, device);
-    let styled = valid.stylize(content.clone());
+    let styled = valid.stylize_style(content.clone(), style_index);
     let mut out = tensor_to_rgb(styled)?;
     if (w, h) != padded.dimensions() {
         out = image::imageops::crop_imm(&out, 0, 0, w, h).to_image();
     }
-    let path = output_dir.join(format!("sample_{step:06}_{name}.png"));
+    let file_tag = if style_name.is_empty() {
+        name.to_owned()
+    } else {
+        format!("{style_name}_{name}")
+    };
+    let path = output_dir.join(format!("sample_{step:06}_{file_tag}.png"));
     save_rgb(&out, &path)?;
 
     let lapvar = eval::lapvar(&out);
@@ -1631,7 +1871,7 @@ where
         }
         save_rgb(
             &target,
-            output_dir.join(format!("target_{step:06}_{name}.png")),
+            output_dir.join(format!("target_{step:06}_{file_tag}.png")),
         )?;
         let psnr = eval::psnr(&out, &target)?;
         let lapvar_t = eval::lapvar(&target);

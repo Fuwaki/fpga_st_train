@@ -1,0 +1,29 @@
+{
+  "arch": "tiny_dw_guided",
+  "options": {
+    "base": 32,
+    "film_full": 0,
+    "film_h2": 1,
+    "full": 0,
+    "guide": 8,
+    "h2_guide": 16,
+    "in_eps": 0.00001,
+    "pre_in_gain": "sqrt2",
+    "res_blocks": 1,
+    "trunk": 96,
+    "trunk_at": "h4",
+    "trunk_norm_kind": "in",
+    "up_h2": 48,
+    "up_h4": 32
+  },
+  "meta": {
+    "bits": "W4A8",
+    "calibration_batches": 20,
+    "calibration_safety": 1.0,
+    "iterations": 6000,
+    "run": "j_ref_in",
+    "style": "experiments/tiny_dw_whitebox_ln/configs/../../../../teachers/whitebox/cartoonizer.onnx",
+    "weight_bytes": 21060,
+    "weight_packing": "i4-x2"
+  }
+}
