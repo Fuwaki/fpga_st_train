@@ -89,8 +89,19 @@ def losses(y, x, b, E, cfg):
     if 'paper' in cfg:  # line art: non-edge goes to paper white
         Lt = Lt * (1 - cfg['paper_mix']) + cfg['paper'] * cfg['paper_mix']
     out['tone'] = (gauss(L, 4) - gauss(Lt, 4)).abs().mean()
-    # chroma: same hue as base, scaled by `sat`
-    out['chroma'] = (gauss(chroma(y), 2) - cfg.get('sat', 1.0) * gauss(chroma(b), 2)).abs().mean()
+    # chroma: same hue as base, scaled by `sat` about the image's mean cast, so sat
+    # boosts colour contrast without multiplying COCO's warm average into a yellow cast
+    cb = chroma(b)
+    cast_b = cb.mean((2, 3), keepdim=True)
+    out['chroma'] = (gauss(chroma(y), 2) - cast_b - cfg.get('sat', 1.0) * gauss(cb - cast_b, 2)).abs().mean()
+    # white balance: mean chroma in each of 4 soft luma bands of the base matches the base.
+    # Blue has 0.114 of luma, so tone targets are otherwise cheapest to meet through R and G.
+    cy = chroma(y)
+    out['cast'] = 0
+    for c in (0.125, 0.375, 0.625, 0.875):
+        wgt = (1 - (Lb - c).abs() * 4).clamp(min=0)
+        n = wgt.sum((2, 3)).clamp(min=1e-3)
+        out['cast'] = out['cast'] + (((cy - cb) * wgt).sum((2, 3)) / n).abs().mean()
     # clipping / dead image guards
     out['clip'] = (hinge(y - 1) + hinge(-y)).mean()
     _, sd = tone_stats(y)
@@ -109,20 +120,28 @@ def batch(a):
 def packet_param_names(p, style):
     gn, bn, fn = norm_names(style)
     names = [gn, bn] + [n for n in p if n.startswith(fn + '.')]
-    names += [n for n in guide_affine_names(style) if n in p]
+    names += [n for w in AFFINE_LAYERS for n in affine_names(style, w) if n in p]
+    mix = ("" if style == 0 else f"style_packets.{style-1}.") + "out_mix"
+    names += [mix] if mix in p else []
     return names
 
 
 def bias_penalty(p, style, margin=0.9):
     """Hinge on the folded int16 guide bias code, `margin` of full scale."""
-    lg, _ = guide_affine_names(style)
-    if lg not in p:
-        return torch.zeros(())
-    code = guide_bias_codes(p, style) / 32767
-    return (F.relu(code - margin) ** 2).sum() + 1e-3 * (p[lg] ** 2).sum()
+    out = torch.zeros(())
+    for what in AFFINE_LAYERS:
+        lg, _ = affine_names(style, what)
+        if lg not in p:
+            continue
+        # head/out s_in come from one calibration and move per style: keep half scale.
+        m = margin if what == "guide_affine" else 0.5
+        code = affine_bias_codes(p, style, what) / 32767
+        out = out + (F.relu(code - m) ** 2).sum() + 1e-3 * (p[lg] ** 2).sum()
+    return out
 
 
-def optimise(p, cfg, names, steps=200, lr=0.03, bs=6, style=0, seed=0, log=50):
+def optimise(p, cfg, names, steps=200, lr=0.03, bs=6, style=0, seed=0, log=50, ref=None):
+    """`ref` holds the params whose style 0 is the base render; defaults to `p`."""
     torch.set_grad_enabled(True)
     pool = coco.load('coco_train')
     rng = np.random.default_rng(seed)
@@ -135,7 +154,7 @@ def optimise(p, cfg, names, steps=200, lr=0.03, bs=6, style=0, seed=0, log=50):
     for it in range(steps):
         x = batch(pool[rng.choice(len(pool), bs, replace=False)])
         with torch.no_grad():
-            b = forward(p, x, 0) if 'ref' not in cfg else cfg['ref'](x)
+            b = forward(ref if ref is not None else p, x, 0) if 'ref' not in cfg else cfg['ref'](x)
             E = edge_map(x)
         y = forward(q, x, style)
         parts = losses(y, x, b, E, cfg)
@@ -169,9 +188,23 @@ STYLES = {
     'lineart2': dict(contrast=0.5, lift=0.0, paper=0.93, paper_mix=0.85, sat=0.35, edge=0.6, min_std=0.08,
                      w=dict(flat=16.0, edge=0.0, line=30.0, tone=5.0, chroma=3.0, clip=10, spread=2)),
 }
-STYLES['comic'] = STYLES['poster']
+STYLES['comic'] = dict(STYLES['poster'], w=dict(STYLES['poster']['w']))
 # 水粉 gouache: replaces line art in slot 1. Pastel tone lifted toward paper, moderate
 # colour, flat strokes, faint outlines only.
 STYLES['gouache'] = dict(levels=1.4, contrast=0.85, lift=0.08, paper=0.85, paper_mix=0.3, sat=1.0,
                          edge=0.7, min_std=0.12,
                          w=dict(flat=14.0, edge=1.0, line=4.0, tone=5.0, chroma=4.0, clip=10, spread=4))
+
+# 2026-11-03: the s3b set drifted yellow (whites to cream, (R+G)/2-B +0.2 to +0.33 on COCO).
+# The cast term holds the base's white balance per luma band.
+for _n in ('bright', 'gouache', 'comic'):
+    STYLES[_n]['w']['cast'] = 30.0
+
+# With the base pinned to the source checkpoint's style 0 (no longer the boosted slot 0),
+# the s3b strengths come out close to the photo. Stronger targets for the s3d set.
+STYLES['bright_v2'] = dict(STYLES['bright'], sat=2.3, contrast=1.3,
+                           w=dict(STYLES['bright']['w'], flat=14.0, cast=15.0))
+STYLES['gouache_v2'] = dict(STYLES['gouache'], sat=1.3,
+                            w=dict(STYLES['gouache']['w'], flat=18.0, cast=15.0))
+STYLES['comic_v2'] = dict(STYLES['comic'], sat=2.5, contrast=1.45,
+                          w=dict(STYLES['comic']['w'], flat=18.0, line=45.0, cast=15.0))

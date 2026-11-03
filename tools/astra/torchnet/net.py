@@ -59,6 +59,38 @@ def norm_names(style):
     return pre + "trunk_norm.norm.affine.gamma", pre + "trunk_norm.norm.affine.beta", pre + "film_h2"
 
 
+def affine_names(style, what):
+    """Per-style `x * exp(log_gain) + bias`. what: guide_affine | head_affine | out_affine."""
+    pre = "" if style == 0 else f"style_packets.{style-1}."
+    return pre + what + ".log_gain", pre + what + ".bias"
+
+
+def apply_affine(p, x, style, what):
+    lg, gb = affine_names(style, what)
+    if lg not in p:
+        return x
+    return x * torch.exp(p[lg]).view(1, -1, 1, 1) + p[gb].view(1, -1, 1, 1)
+
+
+# layer -> (conv weight, s_in of its input point in the whitebox_bright manifest).
+# Limit on |b_conv + b/g| is 32767 * s_in / 127 * max|W_c|.
+AFFINE_LAYERS = {
+    "guide_affine": ("guide.conv", 0.006769571918994188),
+    "head_affine": ("head_sep.dw.conv", 0.025984487),
+    "out_affine": ("head_sep.pw.conv", 0.040137835),
+}
+
+
+def affine_bias_codes(p, style, what):
+    """Folded int16 bias code per channel of the layer `what` folds into (float, unsigned)."""
+    stem, s_in = AFFINE_LAYERS[what]
+    w, b = p[stem + ".weight"], p[stem + ".bias"]
+    mx = w.abs().flatten(1).max(1).values
+    lg, gb = affine_names(style, what)
+    eff = b + p[gb] / torch.exp(p[lg]) if lg in p else b.clone()
+    return eff.abs() / (mx * 32767 * s_in / 127) * 32767
+
+
 def guide_affine_names(style):
     """`packet_guide`: x * exp(log_gain) + bias on the guide conv, before its ReLU."""
     pre = "" if style == 0 else f"style_packets.{style-1}."
@@ -132,7 +164,11 @@ def forward(p, x, style=0, tap=None, norm_fn=None, film_fn=None):
         g = g * torch.exp(p[lg]).view(1, -1, 1, 1) + p[gb].view(1, -1, 1, 1)
     g = F.relu(g); t("guide", g)
     f = f + g; t("mix", f)
-    y = pw(p, "head_sep.pw", F.relu(dw(p, "head_sep.dw", f)))
+    h = apply_affine(p, dw(p, "head_sep.dw", f), style, "head_affine")
+    y = apply_affine(p, pw(p, "head_sep.pw", F.relu(h)), style, "out_affine")
+    mix = ("" if style == 0 else f"style_packets.{style-1}.") + "out_mix"
+    if mix in p:  # experiment: per-style 3x3 colour matrix, folds into head.pw rows
+        y = torch.einsum("ij,njhw->nihw", p[mix], y)
     y = y[:, :, :h0, :w0]
     t("rgb", y)
     return y
