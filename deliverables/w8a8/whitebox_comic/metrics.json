@@ -1,0 +1,72 @@
+{
+  "model": "runs/astra2/split/comic",
+  "quant": "runs/astra2/split/comic/quant/w8a8",
+  "arch": "tiny_dw_guided",
+  "bits": {
+    "acts": 8,
+    "weights": 8
+  },
+  "weight_packing": "i8-x1",
+  "weight_bytes": 28334,
+  "calibration_batches": null,
+  "content_images": 6,
+  "size": 384,
+  "mean": {
+    "fp32_vs_sim_db": 34.253967550548715,
+    "fp32_vs_int_db": 34.212813888977344,
+    "sim_vs_int_db": 35.45549170064237,
+    "rmse_lsb": 5.013450038143871,
+    "rmse_over_signal_std": 0.08827469159027702,
+    "max_abs_error_lsb": 42.833333333333336
+  },
+  "per_image": {
+    "animal.png": {
+      "fp32_vs_sim_db": 32.31862976468869,
+      "fp32_vs_int_db": 32.107024359798764,
+      "sim_vs_int_db": 33.17455652777778,
+      "rmse_lsb": 6.3268707497591565,
+      "rmse_over_signal_std": 0.10306906391612382,
+      "max_abs_error_lsb": 39.0
+    },
+    "cat.png": {
+      "fp32_vs_sim_db": 34.248446483378466,
+      "fp32_vs_int_db": 34.34357852271199,
+      "sim_vs_int_db": 35.484099693386895,
+      "rmse_lsb": 4.890589986451696,
+      "rmse_over_signal_std": 0.09360043055125615,
+      "max_abs_error_lsb": 45.0
+    },
+    "city.png": {
+      "fp32_vs_sim_db": 34.09961737227527,
+      "fp32_vs_int_db": 34.24727023352092,
+      "sim_vs_int_db": 34.960310342171134,
+      "rmse_lsb": 4.945118109331098,
+      "rmse_over_signal_std": 0.06743339833759604,
+      "max_abs_error_lsb": 37.0
+    },
+    "landscape.png": {
+      "fp32_vs_sim_db": 35.11541577241533,
+      "fp32_vs_int_db": 35.01116288724893,
+      "sim_vs_int_db": 37.67369127889717,
+      "rmse_lsb": 4.528788468738042,
+      "rmse_over_signal_std": 0.16503024174655906,
+      "max_abs_error_lsb": 40.0
+    },
+    "portrait.png": {
+      "fp32_vs_sim_db": 36.20372658492402,
+      "fp32_vs_int_db": 36.002604043315344,
+      "sim_vs_int_db": 37.48368316768298,
+      "rmse_lsb": 4.040266181058135,
+      "rmse_over_signal_std": 0.04081904142487351,
+      "max_abs_error_lsb": 39.0
+    },
+    "water.png": {
+      "fp32_vs_sim_db": 33.537969325610504,
+      "fp32_vs_int_db": 33.56524328726812,
+      "sim_vs_int_db": 33.95660919393826,
+      "rmse_lsb": 5.349066733525098,
+      "rmse_over_signal_std": 0.05969597356525362,
+      "max_abs_error_lsb": 57.0
+    }
+  }
+}

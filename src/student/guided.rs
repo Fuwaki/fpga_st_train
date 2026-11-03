@@ -20,7 +20,7 @@
 //! guide, and either InstanceNorm or LayerNorm. Shuffle, a full-resolution stack, and the
 //! other guide mixes stay fp32.
 
-use burn::module::Module;
+use burn::module::{Module, Param};
 use burn::prelude::*;
 use burn::tensor::activation::relu;
 use burn::tensor::module::{avg_pool2d, interpolate};
@@ -119,6 +119,10 @@ pub struct GuideSpec {
     /// Style packets. `1` is the single trunk norm and H/2 FiLM. Each extra
     /// style copies that pair and leaves every convolution shared.
     pub styles: usize,
+    /// Each style, style 0 included, carries a per-channel `exp(log_gain)`, `bias`
+    /// on the full-resolution guide before its ReLU. The gain stays positive so the
+    /// fold into the guide kernel keeps one set of int8 weight codes for every style.
+    pub packet_guide: bool,
 }
 
 /// Inverse of [`RGB_FROM_YCBCR`]. Rows are Y, Cb, Cr. Same numbers as
@@ -249,6 +253,7 @@ impl GuideSpec {
             },
             input_quant: config.str_option("input_quant", "none").to_string(),
             styles: config.usize_option("styles", 1),
+            packet_guide: config.usize_option("packet_guide", 0) != 0,
         };
         spec.check()?;
         Ok(spec)
@@ -623,8 +628,34 @@ pub fn v0_cost(height: usize, width: usize) -> CostReport {
 struct StylePacket<B: Backend> {
     trunk_norm: Plugin<B>,
     film_h2: Film<B>,
+    guide_affine: Option<GuideAffine<B>>,
 }
 
+/// Per-channel `x · exp(log_gain) + bias` on the guide conv output, before its ReLU.
+///
+/// Folds into the guide kernel as `W·g`, `bias_conv·g + bias`. A positive `g` keeps
+/// the per-channel int8 codes of `W` and only moves the requant multiplier; a negative
+/// `bias` raises the threshold, which is how a style closes a guide channel.
+#[derive(Module, Debug)]
+pub struct GuideAffine<B: Backend> {
+    log_gain: Param<Tensor<B, 1>>,
+    bias: Param<Tensor<B, 1>>,
+}
+
+impl<B: Backend> GuideAffine<B> {
+    fn new(channels: usize, device: &B::Device) -> Self {
+        Self {
+            log_gain: Param::from_tensor(Tensor::zeros([channels], device)),
+            bias: Param::from_tensor(Tensor::zeros([channels], device)),
+        }
+    }
+
+    fn forward(&self, x: Tensor<B, 4>) -> Tensor<B, 4> {
+        let c = self.bias.dims()[0];
+        let gain = self.log_gain.val().exp().reshape([1, c, 1, 1]);
+        x * gain + self.bias.val().reshape([1, c, 1, 1])
+    }
+}
 
 fn trunk_plugin<B: Backend>(spec: &GuideSpec, device: &B::Device) -> Plugin<B> {
     match spec.trunk_norm_kind.as_str() {
@@ -663,6 +694,8 @@ pub struct GuidedStudent<B: Backend> {
     guide_gain: Option<PwConv<B>>,
     /// Styles 1..N. Empty when `styles` is 1, so the parameter names do not move.
     style_packets: Vec<StylePacket<B>>,
+    /// Style 0's guide affine. `None` unless `packet_guide`, so old names do not move.
+    guide_affine: Option<GuideAffine<B>>,
     #[module(skip)]
     spec: GuideSpec,
 }
@@ -743,8 +776,14 @@ impl<B: Backend> GuidedStudent<B> {
                 .map(|_| StylePacket {
                     trunk_norm: trunk_plugin(&spec, device),
                     film_h2: Film::new(spec.up_h2, device),
+                    guide_affine: spec
+                        .packet_guide
+                        .then(|| GuideAffine::new(spec.guide, device)),
                 })
                 .collect(),
+            guide_affine: spec
+                .packet_guide
+                .then(|| GuideAffine::new(spec.guide, device)),
             spec,
         }
     }
@@ -859,6 +898,10 @@ impl<B: Backend> GuidedStudent<B> {
         tap("paint", &f);
         f = self.up2(f, &self.shuffle_guide);
         let guide = self.guide.forward(x);
+        let guide = match self.guide_affine_at(style) {
+            Some(affine) => affine.forward(guide),
+            None => guide,
+        };
         let guide = if self.spec.guide_relu {
             relu(guide)
         } else {
@@ -906,6 +949,14 @@ impl<B: Backend> GuidedStudent<B> {
         let y = crop_spatial(y, h0, w0);
         tap("rgb", &y);
         (y, in_dead)
+    }
+
+    fn guide_affine_at(&self, style: usize) -> Option<&GuideAffine<B>> {
+        if style == 0 {
+            self.guide_affine.as_ref()
+        } else {
+            self.style_packets[style - 1].guide_affine.as_ref()
+        }
     }
 
     fn norm_at(&self, f: Tensor<B, 4>, style: usize) -> Tensor<B, 4> {
@@ -972,7 +1023,7 @@ impl<B: Backend> StudentModel<B> for GuidedStudent<B> {
             "rgb"
         };
         format!(
-            "tiny_dw_guided pool=2 trunk={trunk} up={up} up_h4={} up_h2={} h2_guide={} guide={} k={} guide_act={guide_act} mix={mix} full={full} norm={} in_eps={:.0e} pre_in_gain={} input={input} quant={} styles={} ({} parameters)",
+            "tiny_dw_guided pool=2 trunk={trunk} up={up} up_h4={} up_h2={} h2_guide={} guide={} k={} guide_act={guide_act} mix={mix} full={full} norm={} in_eps={:.0e} pre_in_gain={} input={input} quant={} styles={}{} ({} parameters)",
             self.spec.up_h4,
             self.spec.up_h2,
             self.spec.h2_guide,
@@ -983,6 +1034,7 @@ impl<B: Backend> StudentModel<B> for GuidedStudent<B> {
             self.spec.pre_in_gain.label(),
             self.spec.input_quant,
             self.spec.styles,
+            if self.spec.packet_guide { " packet_guide" } else { "" },
             self.num_params()
         )
     }
@@ -1115,6 +1167,8 @@ impl<B: Backend> GuidedStudent<B> {
         let spec = &self.spec;
         let reason = if spec.styles > 1 {
             "integer export is one style; the extra packets are not in the manifest"
+        } else if spec.packet_guide {
+            "the guide affine has to be folded into the guide kernel before export"
         } else if spec.shuffle || spec.shuffle_guide {
             "pixel-shuffle is not in the integer manifest"
         } else if !spec.trunk_h4 {
@@ -1737,6 +1791,7 @@ mod tests {
             input_planes: 3,
             input_quant: "none".into(),
             styles: 1,
+            packet_guide: false,
         };
         let report = spec.cost(480, 640);
         let stem = report.rows.iter().find(|row| row.name == "stem").unwrap();
@@ -1778,6 +1833,7 @@ mod tests {
             input_planes: 3,
             input_quant: "none".into(),
             styles: 1,
+            packet_guide: false,
         };
         let report = spec.cost(480, 640);
         let names: Vec<_> = report.rows.iter().map(|row| row.name.as_str()).collect();
@@ -1814,6 +1870,7 @@ mod tests {
             input_planes: 3,
             input_quant: "none".into(),
             styles: 1,
+            packet_guide: false,
         };
         let report = spec.cost(480, 640);
         let names: Vec<_> = report.rows.iter().map(|row| row.name.as_str()).collect();
@@ -1856,6 +1913,7 @@ mod tests {
             input_planes: 3,
             input_quant: "none".into(),
             styles: 1,
+            packet_guide: false,
         };
         let report = spec.cost(480, 640);
         let names: Vec<_> = report.rows.iter().map(|row| row.name.as_str()).collect();
@@ -1895,6 +1953,7 @@ mod tests {
             input_planes: 3,
             input_quant: "none".into(),
             styles: 1,
+            packet_guide: false,
         };
         let report = spec.cost(480, 640);
         let spatial = report
@@ -1942,6 +2001,7 @@ mod tests {
             input_planes: 3,
             input_quant: "none".into(),
             styles: 1,
+            packet_guide: false,
         };
         let report = spec.cost(480, 640);
         let guide = report.rows.iter().find(|row| row.name == "guide").unwrap();
@@ -1978,6 +2038,7 @@ mod tests {
             input_planes: 3,
             input_quant: "none".into(),
             styles: 1,
+            packet_guide: false,
         };
         let h4 = GuideSpec {
             trunk_h4: true,
@@ -2037,6 +2098,7 @@ mod tests {
             input_planes: 3,
             input_quant: "none".into(),
             styles: 1,
+            packet_guide: false,
         };
         let report = spec.cost(480, 640);
         let gain = report
@@ -2079,6 +2141,7 @@ mod tests {
             input_planes: 3,
             input_quant: "none".into(),
             styles: 1,
+            packet_guide: false,
         };
         let resid = GuideSpec {
             trunk_h4: false,
@@ -2088,6 +2151,7 @@ mod tests {
             input_planes: 3,
             input_quant: "none".into(),
             styles: 1,
+            packet_guide: false,
             h2_guide: 0,
             guide_resid: true,
             ..h4
@@ -2162,6 +2226,7 @@ mod tests {
             input_planes: 3,
             input_quant: "none".into(),
             styles: 1,
+            packet_guide: false,
         }
     }
 
@@ -2526,4 +2591,112 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    #[test]
+    fn packet_guide_starts_as_identity_and_moves_one_style() {
+        use burn::backend::NdArray;
+        use burn::record::{FullPrecisionSettings, NamedMpkFileRecorder};
+        type Cpu = NdArray<f32>;
+        let device = Default::default();
+        let model = GuidedStudent::<Cpu>::new(small_packet_spec(serde_json::json!({})), &device);
+        let two = model.expand_styles(2, &device).expect("expand");
+        let wide = two.repack_styles(3, true, &device).expect("repack");
+        assert!(wide.spec.packet_guide);
+        assert_eq!(wide.style_count(), 3);
+        // One more packet, plus a 2-channel gain and bias for each of the 3 styles.
+        let packet = two.num_params() - model.num_params();
+        assert_eq!(wide.num_params(), two.num_params() + packet + 3 * 2 * 2);
+        let ramp = Tensor::<Cpu, 1, Int>::arange(0..3 * 8 * 8, &device)
+            .float()
+            .div_scalar(192.0)
+            .reshape([1, 3, 8, 8]);
+        let out = |m: &GuidedStudent<Cpu>, style: usize| {
+            m.stylize_style(ramp.clone(), style)
+                .into_data()
+                .to_vec::<f32>()
+                .unwrap()
+        };
+        let source = out(&model, 0);
+        for style in 0..3 {
+            for (a, b) in source.iter().zip(&out(&wide, style)) {
+                assert!((a - b).abs() < 1e-5, "style {style}: {a} vs {b}");
+            }
+        }
+        // A bias on style 2 moves its guide map; styles 0 and 1 stay put. The tap is
+        // checked rather than the RGB: a random head can gate the guide off entirely.
+        let guide_tap = |m: &GuidedStudent<Cpu>, style: usize| {
+            let mut seen = Vec::new();
+            m.render_tapped(ramp.clone(), Ablate::None, false, style, &mut |name, t| {
+                if name == "guide" {
+                    seen = t.clone().into_data().to_vec::<f32>().unwrap();
+                }
+            });
+            seen
+        };
+        let before = guide_tap(&wide, 2);
+        let mut moved = wide;
+        moved.style_packets[1].guide_affine.as_mut().unwrap().bias =
+            Param::from_tensor(Tensor::from_floats([1.0, 1.0], &device));
+        let after = guide_tap(&moved, 2);
+        for (a, b) in before.iter().zip(&after) {
+            // relu(x + 1) - relu(x) is in [0, 1].
+            assert!(*b >= *a - 1e-6 && *b - *a <= 1.0 + 1e-5, "{a} -> {b}");
+        }
+        assert!(after.iter().sum::<f32>() > before.iter().sum::<f32>() + 1.0);
+        let closed = out(&moved, 2);
+        for style in 0..2 {
+            for (a, b) in source.iter().zip(&out(&moved, style)) {
+                assert!((a - b).abs() < 1e-5, "style {style} moved: {a} vs {b}");
+            }
+        }
+        // The affine survives a save and reload under the packet_guide spec.
+        let path =
+            std::env::temp_dir().join(format!("fpga_st_packet_guide_{}.mpk", std::process::id()));
+        let spec = moved.spec.clone();
+        moved
+            .save_file(&path, &NamedMpkFileRecorder::<FullPrecisionSettings>::new())
+            .expect("save");
+        let loaded = GuidedStudent::<Cpu>::new(spec, &device)
+            .load_file(
+                &path,
+                &NamedMpkFileRecorder::<FullPrecisionSettings>::new(),
+                &device,
+            )
+            .expect("load packet_guide checkpoint");
+        for (a, b) in closed.iter().zip(&out(&loaded, 2)) {
+            assert!((a - b).abs() < 1e-5, "reload: {a} vs {b}");
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn split_style_folds_the_guide_affine_into_one_style() {
+        use burn::backend::NdArray;
+        type Cpu = NdArray<f32>;
+        let device = Default::default();
+        let model = GuidedStudent::<Cpu>::new(small_packet_spec(serde_json::json!({})), &device);
+        let mut wide = model.repack_styles(2, true, &device).expect("repack");
+        let affine = wide.style_packets[0].guide_affine.as_mut().unwrap();
+        affine.log_gain = Param::from_tensor(Tensor::from_floats([0.3, -0.2], &device));
+        affine.bias = Param::from_tensor(Tensor::from_floats([-0.05, 0.1], &device));
+        let ramp = Tensor::<Cpu, 1, Int>::arange(0..3 * 8 * 8, &device)
+            .float()
+            .div_scalar(192.0)
+            .reshape([1, 3, 8, 8]);
+        for style in 0..2 {
+            let single = wide.split_style(style, &device).expect("split");
+            assert_eq!(single.style_count(), 1);
+            assert!(!single.spec.packet_guide);
+            assert!(single.export_block_reason().is_none() || model.export_block_reason().is_some());
+            let want = wide
+                .stylize_style(ramp.clone(), style)
+                .into_data()
+                .to_vec::<f32>()
+                .unwrap();
+            let got = single.stylize(ramp.clone()).into_data().to_vec::<f32>().unwrap();
+            for (a, b) in want.iter().zip(&got) {
+                assert!((a - b).abs() < 1e-5, "style {style}: {a} vs {b}");
+            }
+        }
+        assert!(wide.split_style(2, &device).is_err());
+    }
 }

@@ -263,16 +263,34 @@ impl<B: Backend> GuidedStudent<B> {
                 self.spec.styles
             ));
         }
-        if styles < 2 {
+        self.repack_styles(styles, self.spec.packet_guide, device)
+    }
+
+    /// Widen to `styles` slots and optionally add the per-style guide affine.
+    ///
+    /// Existing slots keep their weights. New slots copy style 0's packet. A guide
+    /// affine the source does not have starts as the identity (gain 1, bias 0).
+    pub fn repack_styles(
+        &self,
+        styles: usize,
+        packet_guide: bool,
+        device: &B::Device,
+    ) -> Result<Self, String> {
+        if styles < 2 || styles < self.spec.styles {
             return Err(format!(
-                "expand_styles needs at least 2 styles, got {styles}"
+                "repack_styles needs at least 2 and at least the current {} styles, got {styles}",
+                self.spec.styles
             ));
+        }
+        if self.spec.packet_guide && !packet_guide {
+            return Err("repack_styles does not drop a trained guide affine".to_owned());
         }
         if !self.spec.film_h2 {
             return Err("style packets need the H/2 FiLM".to_owned());
         }
         let mut spec = self.spec.clone();
         spec.styles = styles;
+        spec.packet_guide = packet_guide;
         spec.check()?;
         let wide = GuidedStudent::new(spec, device);
         let source = collect_weights(self);
@@ -280,19 +298,19 @@ impl<B: Backend> GuidedStudent<B> {
         let mut filled = BTreeSet::new();
         for (path, packed) in &source {
             if !weights.contains_key(path) {
-                return Err(format!(
-                    "single-style weight {path} is not in the packet graph"
-                ));
+                return Err(format!("source weight {path} is not in the packet graph"));
             }
             weights.insert(path.clone(), packed.clone());
             filled.insert(path.clone());
         }
-        for slot in 0..styles - 1 {
+        for slot in self.spec.styles - 1..styles - 1 {
             for (path, packed) in &source {
                 let dest = if let Some(rest) = path.strip_prefix("trunk_norm.") {
                     format!("style_packets.{slot}.trunk_norm.{rest}")
                 } else if let Some(rest) = path.strip_prefix("film_h2.") {
                     format!("style_packets.{slot}.film_h2.{rest}")
+                } else if let Some(rest) = path.strip_prefix("guide_affine.") {
+                    format!("style_packets.{slot}.guide_affine.{rest}")
                 } else {
                     continue;
                 };
@@ -301,6 +319,14 @@ impl<B: Backend> GuidedStudent<B> {
                 }
                 weights.insert(dest.clone(), packed.clone());
                 filled.insert(dest);
+            }
+        }
+        // A new guide affine keeps its identity init.
+        if !self.spec.packet_guide {
+            for path in weights.keys() {
+                if path.contains("guide_affine.") {
+                    filled.insert(path.clone());
+                }
             }
         }
         let wide_paths = param_paths(&wide);
@@ -326,6 +352,91 @@ impl<B: Backend> GuidedStudent<B> {
             return Err(format!("expand_styles left unused weights: {left}"));
         }
         Ok(wide)
+    }
+
+    /// One style as a single-style student the integer export accepts.
+    ///
+    /// The style's trunk norm and H/2 FiLM move to the checkpoint-compatible names.
+    /// Its guide affine folds into the guide conv: `W·g`, `bias·g + b`. `g > 0`, so the
+    /// per-output-channel int8 codes of `W` are the same for every style; only the
+    /// weight scale, the bias and the requant multiplier change.
+    pub fn split_style(&self, style: usize, device: &B::Device) -> Result<Self, String> {
+        if style >= self.spec.styles {
+            return Err(format!(
+                "split_style: style {style} is outside 0..{}",
+                self.spec.styles
+            ));
+        }
+        let mut spec = self.spec.clone();
+        spec.styles = 1;
+        spec.packet_guide = false;
+        spec.check()?;
+        let single = GuidedStudent::new(spec, device);
+        let source = collect_weights(self);
+        let mut weights = collect_weights(&single);
+        let prefix = if style == 0 {
+            String::new()
+        } else {
+            format!("style_packets.{}.", style - 1)
+        };
+        let mut filled = BTreeSet::new();
+        for path in weights.keys().cloned().collect::<Vec<_>>() {
+            let from = if path.starts_with("trunk_norm.") || path.starts_with("film_h2.") {
+                format!("{prefix}{path}")
+            } else {
+                path.clone()
+            };
+            let packed = source
+                .get(&from)
+                .ok_or_else(|| format!("split_style: source has no {from}"))?;
+            weights.insert(path.clone(), packed.clone());
+            filled.insert(path);
+        }
+        if self.spec.packet_guide {
+            let log_gain = source
+                .get(&format!("{prefix}guide_affine.log_gain"))
+                .ok_or("split_style: missing guide_affine.log_gain")?;
+            let shift = source
+                .get(&format!("{prefix}guide_affine.bias"))
+                .ok_or("split_style: missing guide_affine.bias")?;
+            let gain: Vec<f32> = log_gain.data.iter().map(|v| v.exp()).collect();
+            let weight = weights
+                .get_mut("guide.conv.weight")
+                .ok_or("split_style: no guide.conv.weight")?;
+            let per_out = weight.data.len() / gain.len();
+            for (index, value) in weight.data.iter_mut().enumerate() {
+                *value *= gain[index / per_out];
+            }
+            let bias = weights
+                .get_mut("guide.conv.bias")
+                .ok_or("split_style: no guide.conv.bias")?;
+            for ((value, g), b) in bias.data.iter_mut().zip(&gain).zip(&shift.data) {
+                *value = *value * g + b;
+            }
+        }
+        let paths = param_paths(&single);
+        if filled != paths {
+            return Err(format!(
+                "split_style missed {}\n  unexpected {}",
+                set_diff(&paths, &filled),
+                set_diff(&filled, &paths),
+            ));
+        }
+        let mut installer = Installer {
+            path: Vec::new(),
+            slots: weights,
+        };
+        let single = single.map(&mut installer);
+        if !installer.slots.is_empty() {
+            let left = installer
+                .slots
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(format!("split_style left unused weights: {left}"));
+        }
+        Ok(single)
     }
 
     fn ensure_whitebox_line(&self) -> Result<(), String> {
@@ -910,6 +1021,7 @@ mod tests {
             input_planes: 3,
             input_quant: "none".into(),
             styles: 1,
+            packet_guide: false,
         };
         let rgb_model = GuidedStudent::<Cpu>::new(spec, &device);
         let yc_model = rgb_model.fold_yc(&device).expect("fold");

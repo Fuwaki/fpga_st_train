@@ -1,0 +1,32 @@
+{
+  "arch": "tiny_dw_guided",
+  "options": {
+    "base": 16,
+    "film_full": 0,
+    "film_h2": 1,
+    "full": 0,
+    "guide": 8,
+    "h2_guide": 10,
+    "in_eps": 0.00001,
+    "pre_in_gain": "sqrt2",
+    "res_blocks": 1,
+    "trunk": 80,
+    "trunk_at": "h4",
+    "trunk_norm_kind": "ln",
+    "up_h2": 40,
+    "up_h4": 24
+  },
+  "meta": {
+    "bits": "W8A8",
+    "calibration_batches": 20,
+    "calibration_safety": 1.0,
+    "iterations": 2000,
+    "packed_from": "experiments/tiny_dw_whitebox_sky_480p/trials/packets/model.mpk",
+    "run": "packets",
+    "split_from": "runs/astra2/final_s3b/model.mpk",
+    "split_style": 0,
+    "style": "whitebox:experiments/tiny_dw_whitebox_sky_480p/configs/../../../../teachers/whitebox/cartoonizer.onnx, sky:experiments/tiny_dw_whitebox_sky_480p/configs/../../../../teachers/sky/sky-44355.onnx",
+    "weight_bytes": 28334,
+    "weight_packing": "i8-x1"
+  }
+}

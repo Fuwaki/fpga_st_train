@@ -28,6 +28,7 @@ pub fn dispatch(command: Command, device: &str) -> Result<()> {
         Command::Prune(args) => prune::run(args, device),
         Command::FoldYc(args) => fold_yc::run(args, device),
         Command::PackStyles(args) => pack_styles::run(args, device),
+        Command::SplitStyle(args) => pack_styles::split(args, device),
         Command::Infer(args) => infer::run(args, device),
         Command::Calibrate(args) => calibrate::run(args, device),
         Command::ExportInt8(args) => export_int8::run(args, device),

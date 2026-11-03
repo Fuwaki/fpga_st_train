@@ -1,0 +1,233 @@
+# 双风格 packets 权重分析与画风挖掘（astra2）
+
+起点：`experiments/tiny_dw_whitebox_sky_480p/trials/packets`（`tiny_dw_guided`，trunk=H/4，LN，film_h2，h2_guide=10，guide=8，styles=2，32071 参数）。
+
+方向（用户定）：小模型走**简化画风**——线稿、动漫平涂、色块。不追梵高式笔触：这个规模画不出高频纹理。
+
+## 工具
+
+| 文件 | 作用 |
+|---|---|
+| `tools/astra/weights.py` | 读写 `model.mpk`（上一轮留下） |
+| `tools/astra/torchnet/net.py` | PyTorch CPU 版前向，对 Rust fp32：MAE 0.001、99.9% 像素差 < 0.003，只有反射填充的底边一行差别略大 |
+| `tools/astra/torchnet/metrics.py` | 滤镜检验（逐通道 `a*x+b`、3×3 颜色矩阵残差）、平坦度、线条、k-means 色块度 |
+| `tools/astra/torchnet/coco.py` | 从 HF 缓存切 COCO 320×240：train 800 张（shard 0、1），val 96 张（shard 9）→ `~/.cache/astra/*.npy` |
+| `tools/astra/torchnet/ln_jacobian.py`, `mine.py` | 输出对 LN γ/β 的雅可比，分成滤镜分量和结构分量后做 SVD / Gram 特征分解 |
+| `tools/astra/torchnet/scan.py` | 沿模态 ±2/4/6 扫描，打简化画风分数 |
+| `tools/astra/torchnet/styles.py`, `run_mine.py` | 可微画风目标，只优化风格包（LN，或 LN+FiLM），共享卷积冻结 |
+
+运行环境：`~/.venvs/astra/bin/python`（系统 torch 2.14，另装 msgpack），在仓库根目录执行。单张 640×427 前向 0.05–0.2 s；batch 6 张 320×240 的前向加反传约 0.13 s。
+
+## 结论
+
+### 1. 风格 0 像原图，是因为白盒教师就像原图
+
+教师输出相对原图：亮度、标准差、饱和度只差 0.01–0.03，逐通道 `a*x+b` 残差 0.012–0.045。学生和教师已经很接近。要让风格 0 一眼就能看出来，得靠色彩或简化，继续逼近教师没有用。
+
+### 2. 风格 1 的蓝滤镜是对 sky 教师的 MSE 最优拟合
+
+按原图亮度分 5 档，比较 6 张 demo 图汇总后的平均输出色：
+
+```
+photo  [0.06,0.05,0.05] [0.26,0.30,0.30] [0.50,0.52,0.46] [0.68,0.71,0.71] [0.87,0.86,0.85]
+s1     [0.30,0.33,0.46] [0.29,0.36,0.46] [0.41,0.45,0.49] [0.46,0.52,0.59] [0.57,0.61,0.66]
+Tsky   [0.35,0.37,0.47] [0.36,0.36,0.45] [0.53,0.46,0.48] [0.51,0.52,0.56] [0.56,0.62,0.63]
+```
+
+两条曲线几乎重合。sky 的橙色光晕和笔触是局部的、跟内容相关的，风格包表达不出来。结论是放弃 sky，给风格 1 换新目标。
+
+### 3. LN 的 γ/β 是一个风格空间，不只是调色
+
+在 64 张 COCO（160×120）上累加雅可比的 Gram 矩阵：
+
+- 全分量前几个模态的 √特征值 / 滤镜占比：183.7/0.81，120.5/0.78，66.3/0.30，53.8/0.63…
+- 去掉滤镜分量后的结构谱：91.7，68.9，45.0，36.0，29.8…；结构能量占总能量的 37%。
+
+沿单个模态走（`runs/astra2/lnjac/scan_pick.png`）：
+
+- 结构 1 +4：稳定的黑白版画；
+- 结构 3 −6：淡彩勾线；
+- 结构 1 −6、结构 6 −6、全分量 1 −6：更平但更软。
+
+单个模态都夹带色偏，所以改用定向优化（见第 5 节）。
+
+### 4. 结构瓶颈：画面内部的“平”被共享引导核卡住
+
+把一条通路换成它的空间均值做消融（24 张 val 图）：
+
+| 消融 | 非边缘高频 | 边缘高频 | 亮度标准差 |
+|---|---:|---:|---:|
+| 原样 | 0.0144 | 0.042 | 0.240 |
+| 铺色 → 均值 | 0.0126 | 0.029 | 0.140 |
+| 引导 → 均值 | 0.0054 | 0.012 | 0.165 |
+| 引导 ×2 | 0.0513 | 0.112 | 0.409 |
+| 铺色 ×2 | 0.0283 | 0.064 | 0.293 |
+
+head 深度卷积后面那个 ReLU 的门（核和 / 偏置 / 开启比例 / 输出权重）：
+
+| ch | 核和 | 偏置 | 开启比例 | 作用 |
+|---|---:|---:|---:|---|
+| 0,2,4,6 | +1.2…+1.7 | ≈0 | 100% | **常开**，引导细节和色度线性直通 |
+| 5 | +0.58 | −0.49 | 15% | **墨线笔**：打开时 RGB 一起 −0.9 左右 |
+| 1 | −1.06 | +0.40 | 85% | 暗部阴影 |
+| 3 | −0.29 | +0.08 | 97% | — |
+| 7 | −0.74 | −0.11 | 0% | 死通道 |
+
+引导核（`guide.conv`）每个通道的纹理都没有边缘选择性：边缘高频和非边缘高频之比只有约 2。ch6 的 RGB 直流是 [0.75, −0.66, 0.38]，相当于把全分辨率的 R−G 色度直接贴回去，这就是“照片感”的主要来源。
+
+**推论**：风格包（LN、FiLM）都在 ch0/2/4/6 的上游，关不掉这几路直通的纹理，所以做不出“内部平、边缘利”。要做到，需要引导分支也随风格变化。
+
+### 5. 定向挖掘（只训练风格包）
+
+目标都是可微的：
+
+- 平坦：非边缘区域的 TV；
+- 保边：边缘处的亮度对比不低于照片；
+- 墨线：照片边缘处的亮度低于局部均值；
+- 色调：σ=4 低频亮度跟随“基线 × 对比 + 提亮”；
+- 色度：跟随基线色度 × sat；
+- 另有防过曝、防死图的约束。
+
+先只放开 LN 跑 300 步（`runs/astra2/mine/ln1`），再从这个结果出发放开 LN+FiLM 跑 300 步（`pk1`）。24 张 val 图上的结果：
+
+| 风格 | flat（基线 0.55） | edge_keep（基线 0.88） | sat（基线 0.23） | luma | 观感 |
+|---|---:|---:|---:|---:|---|
+| anime | 0.60 | 0.76 | 0.34 | 0.47 | 更亮、更暖、更饱和，略平滑 |
+| lineart | 0.57 | 0.57 | 0.05 | 0.85 | 白纸底配勾线，偏浮雕，线偏灰 |
+| poster | 0.62 | 0.71 | 0.46 | 0.43 | 高对比高饱和，和 anime 区分不够 |
+
+只放开 LN 时 flat 反而下降：提对比会把铺色和引导一起放大。
+
+另外做了一次包级拟合：目标是“风格 0 输出加亮度 S 曲线、对比 ×1.35、饱和 ×1.4”，只用 4 张 demo 图训练。训练图上能拟合，但留出的暗图被压坏了。凡是“风格包可以做到”的结论，都要用 COCO 的多张图来验证。
+
+## 6. `packet_guide`：每个风格的引导仿射（Rust 已实现）
+
+`relu(guide_conv(x) · exp(log_gain_s) + bias_s)`。每个风格（风格 0 也有一份）多 8+8 个参数。
+
+| 位置 | 改动 |
+|---|---|
+| `src/student/guided.rs` | `GuideSpec.packet_guide`（`model.json` 里写 `"packet_guide": 1`，默认 0）；新模块 `GuideAffine { log_gain, bias }`，初始化为 0，即恒等；顶层的 `guide_affine` 给风格 0，`StylePacket.guide_affine` 给风格 k；`render_tapped` 在引导卷积之后、ReLU 之前套用；开启后 `export_block_reason` 拒绝整数导出（导出前需要先折叠）；`describe` 末尾标 `packet_guide` |
+| `src/student/guided_prune.rs` | 新增 `repack_styles(styles, packet_guide)`：N 个风格扩到 M 个，已有的槽保留原权重，新槽复制风格 0，新加的仿射保持恒等。`expand_styles` 改为调用它 |
+| `src/commands/pack_styles.rs`, `src/cli.rs` | `pack-styles --styles M --packet-guide`；源模型可以已经是多风格；校验方式是在一张 16×16 的渐变图上，已有风格和源模型输出一致、新风格和风格 0 一致 |
+| 测试 | `packet_guide_starts_as_identity_and_moves_one_style`：恒等初始化；关掉风格 2 的引导不影响风格 0、1；保存后能重新加载 |
+
+`cargo test --lib guided` 在 debug 构建下，`one_style_checkpoint_reloads` 会在默认 2 MB 的测试线程上栈溢出；用 `RUST_MIN_STACK=16777216` 跑 26/26 全部通过。release 主程序不受影响。
+
+### 硬件约束（来自 FPGA 端）
+
+1. **g > 0**。requant 乘数只能是正数，而且 g 为正时 int8 权重码在各风格之间保持不变。实现上 checkpoint 里存 `log_gain`，前向用 `g = exp(log_gain)`，所以任何训练端都不会得到 g ≤ 0。**关门只能靠负的 `bias`**。
+2. **偏置是 16 位**。折叠后 `W' = W·g`，`b' = b_conv·g + b`。偏置码等于 `|b_conv + b/g| · 127 / (s_in · max|W_c|)`，必须小于 32768。
+   - s_in 由导出端给出的“ch5 = 16242”反推：1/s_in ≈ 147.7。
+   - 由此每个通道的上限是 `|b_conv + b/g| < 1.747 · max|W_c|`。
+   - 原 checkpoint 的偏置码：`[1630, 8407, 807, 4288, 4505, 16242, 4136, 7639]`。ch5 已经用到一半。
+   - 训练里用 hinge 平方把它压在满量程的 90% 以内，权重 100，另对 `log_gain` 加 1e-3 的 L2 正则。
+   - 超了的退路：偏置扩到 20 位，多 1 块 RAM。
+3. Python 端：`net.guide_bias_codes(p, style)` 给出折叠后的码值，`styles.bias_penalty` 是对应的正则项。
+
+## 7. 四个风格槽的训练（进行中）
+
+`tools/astra/torchnet/train_styles.py <tag> <steps>`：
+
+- 槽位：0 = pop（增强白盒），1 = anime，2 = lineart，3 = poster；
+- 每个槽训练自己的 LN + FiLM + 引导仿射；共享卷积冻结；
+- 1–3 号槽从 `mine/pk1` 的结果起步；
+- 输出在 `runs/astra2/train/<tag>/`。
+
+### t1（各 400 步，`runs/astra2/train/t1`，Rust 版本在 `runs/astra2/final_t1`）
+
+先用 `pack-styles --from …/packets --out runs/astra2/pack4 --styles 4 --packet-guide` 打包，参数 32071 → 35035，四个风格在渐变图上都和源模型一致。再用 `tools/astra/torchnet/export_pack.py` 把训练好的值写回去：脚本会断言共享权重一个都没变，并逐个风格调用 Rust `infer` 做对比。
+
+Rust 和 torch 的对齐（猫、风景，去掉底边两行）：MAE 0.0009–0.0011，99.9% 分位 < 0.009。
+
+24 张 COCO val 上的指标：
+
+| 槽 | 风格 | flat | edge_keep | sat | line | luma | 引导偏置码（ch0–7） |
+|---|---|---:|---:|---:|---:|---:|---|
+| 0 | pop | 0.45 | 1.01 | 0.30 | −0.007 | 0.46 | 2066 6947 1574 1128 2565 16310 3751 7639 |
+| 1 | anime | 0.65 | 0.68 | 0.39 | −0.017 | 0.48 | 418 19912 1071 22302 3394 11247 1753 7639 |
+| 2 | lineart | 0.52 | 0.63 | 0.07 | **0.039** | 0.76 | 1182 18061 5227 26719 5544 15910 5168 7639 |
+| 3 | poster | 0.69 | 0.60 | 0.49 | −0.014 | 0.44 | 2392 23114 1132 26728 4622 9670 5145 7639 |
+
+所有偏置码都 < 32767，最大 26728（ch3，82%）。引导仿射学到的都是负偏置（关门）；anime 和 poster 还把 ch6（R−G 色度直通）的增益降到 0.87–0.90。
+
+观感（猫、风景，`final_t1/compare.png`）：
+
+- anime：平、艳，像赛璐璐。
+- lineart：猫变成了真正的线稿，鹿角有黑色描边；纸面偏灰，有底纹。
+- pop：在暗图上几乎没有变化。原因是色调目标“围绕均值放大对比”在暗图上拉不起来，于是改成自动色阶。
+- poster：和 anime 太像，于是改成“漫画”：平涂、高饱和，再加墨线。
+
+t2：只重训 pop（`levels=1.8`）和 3 号槽（漫画，`line=20`）。
+
+t2 结果（24 张 val）：pop 的 sat 从 0.30 升到 0.375，暗图上开始拉开；漫画 line 0.054、sat 0.51、edge_keep 0.74，有了墨线，和 anime 明显区分。
+
+## 8. 收敛到三个风格（用户决定，2026-11-03）
+
+四个槽里 pop 和 anime 太接近，硬做四个会显得力不从心。改成三个风格，都从已经训好的包起步：
+
+| 槽 | 名字 | 起点 | 目标 |
+|---|---|---|---|
+| 0 | bright 明亮平涂 | t2 anime | anime 的平坦度，加自动色阶（≤1.8 倍）、sat 1.6；就是用户要的“风格 0 更亮、更跳” |
+| 1 | lineart2 线稿 | t2 lineart | 纸面更白（paper 0.93、mix 0.85），flat 权重 16，压掉底纹 |
+| 2 | comic 漫画 | t2 slot3 | 平涂、高饱和，加墨线（line 20） |
+
+命令：
+
+```
+train_styles.py s3a 400 all bright,lineart2,comic "bright=t2/style1.pt,lineart2=t2/style2.pt,comic=t2/style3.pt"
+pack-styles --from …/packets --out runs/astra2/pack3 --styles 3 --packet-guide
+```
+
+`train_styles.py` 现在可以传槽位列表和起点包，起点包会按新槽位重新映射名字。
+
+### s3a → s3b：线稿改成水粉（用户决定）
+
+s3a 的 lineart2 看起来更像淡彩水粉，不像线稿。真正的黑线只有 head 的 ch5 一支笔，只在强边缘打开；纸面上剩下的是引导核的低幅纹理，看起来就像笔刷底纹。而且漫画已经占了墨线这个方向。所以 1 号槽顺势改成 `gouache`：自动色阶 ≤1.4 倍，contrast 0.85，lift 0.08，向纸色混 30%，sat 1.0，flat 14，line 4。从 s3a 的 lineart2 起步，跑 400 步。
+
+**最终三风格**：`runs/astra2/final_s3b/`，含 `model.json`、`model.mpk`，`styles=3`，`packet_guide=1`，33569 参数。
+
+```
+train_styles.py s3b 400 gouache bright,gouache,comic "gouache=s3a/style1.pt"   # bright、comic 沿用 s3a
+export_pack.py runs/astra2/train/s3b/params.pt runs/astra2/pack3 runs/astra2/final_s3b
+fpga_st_train infer --model runs/astra2/final_s3b --style {0,1,2} --mode fp32 ...
+```
+
+24 张 COCO val 上的指标：
+
+| 槽 | 风格 | flat | edge_keep | sat | line | luma | 偏置码最大值（通道） |
+|---|---|---:|---:|---:|---:|---:|---|
+| 原 0 | whitebox | 0.55 | 0.88 | 0.23 | −0.003 | 0.43 | 16242（ch5） |
+| 0 | bright 明亮平涂 | 0.67 | 0.63 | 0.51 | −0.018 | 0.48 | 25215（ch3） |
+| 1 | gouache 水粉 | 0.74 | 0.39 | 0.31 | 0.001 | 0.62 | 26284（ch3） |
+| 2 | comic 漫画 | 0.45 | 0.71 | 0.59 | **0.072** | 0.46 | **28132（ch1，86%）** |
+
+所有偏置码都在 16 位以内。comic 的 ch1 离满量程只剩 14%，导出时值得留意。
+
+Rust 和 torch 的对齐：MAE 0.0008–0.0012。共享权重已由脚本断言未改动。
+
+滤镜检验（相对原图，`a*x+b` 残差 / 解释比例）：
+
+| | 原 s0 | 原 s1（sky） | bright | gouache | comic |
+|---|---|---|---|---|---|
+| 猫 | 0.015 / 73% | 0.010 / 97% | 0.040 / 44% | 0.016 / 95% | 0.055 / 39% |
+| 风景 | 0.009 / 81% | 0.006 / 98% | 0.023 / 49% | 0.017 / 95% | 0.026 / 60% |
+
+bright 和 comic 明显不是滤镜。gouache 在这两张暗图上 95% 能被调色解释：它的主要动作是大幅提亮，对应的结构变化（变平）在暗图上占比小。在 COCO 的亮图上它最平（flat 0.74）。如果要让它在暗图上也更像画，下一步可以加大 flat 权重，或者加一个色块量化之类的目标。
+
+观感：
+
+- **bright**：亮、艳、平。猫的舞台光变成黄绿色光束，红布更红。
+- **gouache**：浅灰粉底，色彩柔和，有雾感，像水粉。
+- **comic**：黑色描边、高饱和平涂，鹿角和人物都有清楚的墨线。
+
+## 9. 整数导出：按风格拆包，复用现有 manifest 路径
+
+`split_style(k)`（`guided_prune.rs`）和 CLI `split-style --from --style k --out`：把风格 k 的 LN、FiLM 移到单风格的参数名下，并把引导仿射折进 `guide.conv`（`W·g`，`b·g + bias`）。输出是普通的单风格 `tiny_dw_guided`，可以直接走 `scripts/ptq.sh`（calibrate → export-int8 → evaluate）。拆包会自检：单风格模型在渐变图上和打包模型的风格 k 输出一致，最大误差 2.4e-7。单测是 `split_style_folds_the_guide_affine_into_one_style`。
+
+结果（`deliverables/{fp32,w8a8}/whitebox_{bright,gouache,comic}`）：
+
+- 三份 `weights.bin` **逐字节相同**。19 层逐层比对，int8 权重码全部一致，引导层也一样。g > 0 加上按输出通道量化，正好让权重码与 g 无关。
+- 引导层 `bias_int32` 最大值：bright 21678，gouache 22598，comic 24186，都在 int16 以内；其他层也都在范围内。这比按 ch5 = 16242 估算的上限更宽松，因为 calibration 得到的图像 scale 和估算时不同。
+- int/fp32：bright 37.98 dB，gouache 38.53 dB，comic 34.21 dB（参考：已有的 whitebox_ln 是 37.69 dB）。
+
+顺带修了一处测试：`packet_guide_starts_as_identity_and_moves_one_style` 原来通过看 RGB 输出来判断“关掉引导有效果”，但随机初始化的小 head 有时本来就把引导门关着，测试会偶发失败。现在改为检查 `guide` 中间结果。`cargo test --lib` 65/65 通过（debug 下需要 `RUST_MIN_STACK=16777216`）。

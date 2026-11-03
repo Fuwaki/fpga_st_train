@@ -32,6 +32,8 @@ pub enum Command {
     FoldYc(FoldYcArgs),
     /// Duplicate the trunk norm and H/2 FiLM into one packet per style.
     PackStyles(PackStylesArgs),
+    /// Extract one style as a single-style checkpoint for the integer export.
+    SplitStyle(SplitStyleArgs),
     /// Run a delivered model directory over content images (the deployment entry point).
     Infer(InferArgs),
     /// Measure the activation ranges needed for int8 quantisation.
@@ -151,7 +153,7 @@ pub struct FoldYcArgs {
 
 #[derive(Args, Debug)]
 pub struct PackStylesArgs {
-    /// Directory with `model.json` and `model.mpk` from a one-style guided student.
+    /// Directory with `model.json` and `model.mpk` from a guided student.
     #[arg(long)]
     pub from: PathBuf,
     /// Checkpoint inside `--from`. Defaults to `model.mpk`.
@@ -160,9 +162,28 @@ pub struct PackStylesArgs {
     /// Where to write the multi-style `model.mpk` and `model.json`.
     #[arg(long)]
     pub out: PathBuf,
-    /// Style slots. Style 0 keeps the loaded packet; the rest are copies of it.
+    /// Style slots. Existing slots keep their packets; new ones copy style 0.
     #[arg(long, default_value_t = 2)]
     pub styles: usize,
+    /// Add the per-style guide affine (`packet_guide`), initialised to the identity.
+    #[arg(long)]
+    pub packet_guide: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct SplitStyleArgs {
+    /// Directory with a multi-style guided `model.json` and `model.mpk`.
+    #[arg(long)]
+    pub from: PathBuf,
+    /// Checkpoint inside `--from`. Defaults to `model.mpk`.
+    #[arg(long)]
+    pub checkpoint: Option<PathBuf>,
+    /// Style to extract.
+    #[arg(long)]
+    pub style: usize,
+    /// Where to write the single-style `model.mpk` and `model.json`.
+    #[arg(long)]
+    pub out: PathBuf,
 }
 
 #[derive(Args, Debug)]

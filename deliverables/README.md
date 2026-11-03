@@ -91,3 +91,45 @@ scripts/ptq.sh experiments/tiny_dw_whitebox_ln/trials/a_base w8a8
 scripts/ptq.sh experiments/tiny_dw_whitebox_ln/trials/a_base w4a8
 # 再把 model.mpk / quant/<bits>/ 拷到 deliverables/{fp32,w8a8,w4a8}/{whitebox_in,whitebox_ln}/
 ```
+
+
+## 白盒三风格（`tiny_dw_guided`，权重空间挖掘，2026-11-03）
+
+共享卷积来自 `experiments/tiny_dw_whitebox_sky_480p/trials/packets`，**一个都没改**。每个风格只训练自己的包：主干 LN 的 γ、β，H/2 FiLM，以及引导仿射。数据是 COCO，训练在 CPU 上做。完整过程见 `docs/astra-weight-mining.md`。
+
+| 目录名 | 风格 |
+|---|---|
+| `whitebox_bright` | 明亮平涂：更亮、更艳、内部更平 |
+| `whitebox_gouache` | 水粉：浅色粉彩、柔和平涂 |
+| `whitebox_comic` | 漫画：黑色描边、高饱和平涂 |
+| `fp32/whitebox_styles3` | 三个风格打包在一个 checkpoint 里（`styles=3`、`packet_guide=1`），用 `infer --style 0/1/2` 切换 |
+
+**三个 W8A8 包的 `weights.bin` 逐字节相同**，FPGA 只需要存一份权重。每个风格不同的只有 manifest 里的 `point_scales`、各层 `bias_int32`、`requant`、`norm_layers` 和 `film_layers`。引导层之所以也能共用，是因为每个风格的引导增益 `g = exp(log_gain) > 0` 已经折进 `guide.conv`（`W·g`，`b·g + bias`）；按输出通道量化时，权重码 `round(W·g / (g·max|W|/127))` 与 g 无关。
+
+6 张 demo 图、长边 384，`scripts/evaluate.py` 的均值（dB）；最后一列是引导层 `bias_int32` 的最大绝对值，用来对照 16 位偏置 ROM：
+
+| 包 | 位宽 | sim/fp32 | int/fp32 | int/sim | 权重 | 引导层 max\|bias\| |
+|----|------|----------|----------|---------|------|------|
+| `whitebox_bright` | W8A8 | 38.05 | 37.98 | 39.10 | 28334 B | 21678 |
+| `whitebox_gouache` | W8A8 | 38.71 | 38.53 | 40.49 | 28334 B | 22598 |
+| `whitebox_comic` | W8A8 | 34.25 | 34.21 | 35.46 | 28334 B | 24186 |
+
+漫画的 dB 低一些，因为黑线边缘的量化误差更显眼。所有层的 `bias_int32` 都在 int16 以内。W4A8 没有做：白盒结构在 W4A8 下只有 21–24 dB。
+
+```bash
+fpga_st_train infer --model deliverables/w8a8/whitebox_comic --content <图或目录> --out out/ --mode int
+fpga_st_train infer --model deliverables/fp32/whitebox_styles3 --content <图> --out out/ --style 2 --mode fp32
+```
+
+重建：
+
+```bash
+# 1. 打包和训练风格包（Python，CPU）
+fpga_st_train pack-styles --from experiments/tiny_dw_whitebox_sky_480p/trials/packets \
+    --out runs/astra2/pack3 --styles 3 --packet-guide
+python tools/astra/torchnet/export_pack.py runs/astra2/train/s3b/params.pt runs/astra2/pack3 runs/astra2/final_s3b
+# 2. 每个风格拆成单风格模型（折叠引导仿射），再走原来的 PTQ
+fpga_st_train split-style --from runs/astra2/final_s3b --style 0 --out runs/astra2/split/bright   # 1 gouache, 2 comic
+FPGA_ST_BIN=<bin> scripts/ptq.sh runs/astra2/split/bright w8a8 1.0 cpu
+# 3. 拷 model.json/model.mpk 到 fp32/whitebox_<name>/，quant/w8a8/* 到 w8a8/whitebox_<name>/
+```

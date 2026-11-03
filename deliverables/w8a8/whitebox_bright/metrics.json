@@ -1,0 +1,72 @@
+{
+  "model": "runs/astra2/split/bright",
+  "quant": "runs/astra2/split/bright/quant/w8a8",
+  "arch": "tiny_dw_guided",
+  "bits": {
+    "acts": 8,
+    "weights": 8
+  },
+  "weight_packing": "i8-x1",
+  "weight_bytes": 28334,
+  "calibration_batches": null,
+  "content_images": 6,
+  "size": 384,
+  "mean": {
+    "fp32_vs_sim_db": 38.04774099836965,
+    "fp32_vs_int_db": 37.984939300488385,
+    "sim_vs_int_db": 39.097477348437735,
+    "rmse_lsb": 3.2463055499008426,
+    "rmse_over_signal_std": 0.05347505467448507,
+    "max_abs_error_lsb": 19.5
+  },
+  "per_image": {
+    "animal.png": {
+      "fp32_vs_sim_db": 36.124878860061685,
+      "fp32_vs_int_db": 36.358701721526636,
+      "sim_vs_int_db": 38.381208902941374,
+      "rmse_lsb": 3.8779757978954046,
+      "rmse_over_signal_std": 0.05965013093294906,
+      "max_abs_error_lsb": 19.0
+    },
+    "cat.png": {
+      "fp32_vs_sim_db": 38.93700503182924,
+      "fp32_vs_int_db": 39.140581603880364,
+      "sim_vs_int_db": 39.76314322244817,
+      "rmse_lsb": 2.8152119689118464,
+      "rmse_over_signal_std": 0.04516246931867095,
+      "max_abs_error_lsb": 20.0
+    },
+    "city.png": {
+      "fp32_vs_sim_db": 37.22141166996175,
+      "fp32_vs_int_db": 37.405806155104436,
+      "sim_vs_int_db": 37.91775230826607,
+      "rmse_lsb": 3.4375567190712064,
+      "rmse_over_signal_std": 0.04823131879302541,
+      "max_abs_error_lsb": 16.0
+    },
+    "landscape.png": {
+      "fp32_vs_sim_db": 38.016608250686545,
+      "fp32_vs_int_db": 37.29224726963352,
+      "sim_vs_int_db": 38.803432415180325,
+      "rmse_lsb": 3.4827942353466548,
+      "rmse_over_signal_std": 0.10860403306962504,
+      "max_abs_error_lsb": 19.0
+    },
+    "portrait.png": {
+      "fp32_vs_sim_db": 40.12286824714279,
+      "fp32_vs_int_db": 39.95291989747067,
+      "sim_vs_int_db": 40.97571023598203,
+      "rmse_lsb": 2.5638592844262225,
+      "rmse_over_signal_std": 0.024274691672889637,
+      "max_abs_error_lsb": 23.0
+    },
+    "water.png": {
+      "fp32_vs_sim_db": 37.86367393053587,
+      "fp32_vs_int_db": 37.759379155314676,
+      "sim_vs_int_db": 38.743617005808474,
+      "rmse_lsb": 3.3004352937537207,
+      "rmse_over_signal_std": 0.03492768425975031,
+      "max_abs_error_lsb": 20.0
+    }
+  }
+}
